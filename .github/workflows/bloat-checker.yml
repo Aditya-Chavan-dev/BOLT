@@ -1,0 +1,50 @@
+name: Bloat Checker V1 Gate
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  bloat-checker:
+    name: Bloat Checker Policy Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Run Bloat Checker gate
+        run: |
+          set -e
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="origin/${{ github.base_ref }}"
+          elif [ -n "${{ github.event.before }}" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+            BASE="${{ github.event.before }}"
+          elif git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
+            BASE="HEAD~1"
+          else
+            echo "::error::Cannot resolve comparison base for push event (initial commit or missing history). Failing closed."
+            BASE="MISSING_BASE_REVISION"
+          fi
+
+          echo "Evaluating Bloat Checker against base revision: $BASE"
+          node src/gate-runner.mjs --base "$BASE" --output-json bloat-report.json
+
+      - name: Upload Bloat Checker JSON report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bloat-checker-report
+          path: bloat-report.json
+          if-no-files-found: ignore

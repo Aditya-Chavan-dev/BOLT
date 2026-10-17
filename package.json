@@ -1,0 +1,20 @@
+{
+  "name": "bloat-checker",
+  "version": "0.1.0",
+  "description": "Zero-tolerance code bloat and over-engineering verification tool.",
+  "type": "module",
+  "main": "src/gate-runner.mjs",
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {},
+  "devDependencies": {},
+  "bloatChecker": {
+    "exitCodes": {
+      "0": "SUCCESS: All required checks completed and no verified blocking violations found.",
+      "1": "POLICY_FAILURE: One or more verified blocking violations detected.",
+      "2": "VERIFICATION_FAILURE: Required verification or mandatory check could not complete (fail closed).",
+      "3": "SETUP_ERROR: Invalid configuration, missing repository, or invalid CLI arguments."
+    }
+  }
+}
