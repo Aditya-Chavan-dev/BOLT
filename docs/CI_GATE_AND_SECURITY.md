@@ -74,7 +74,7 @@ In every CI run (regardless of pass or fail status), the workflow produces:
 The V1 prototype baseline was evaluated against the 16 completion criteria defined in Section 15 of `BLOAT_CHECKER_V1_BUILD_SPEC.md`.
 
 ### Reported Audit Results
-The IDE audit reported all 16 completion criteria as **PASS**, with the behavioral test suite reporting **45 passed, 0 failed, 1 skipped**.
+The IDE audit reported all 16 completion criteria as **PASS**, with the behavioral test suite reporting **60 passed, 0 failed, 1 skipped** (61 total).
 *(Note: These figures represent reported results from the internal IDE audit execution, not independently reproduced third-party verification.)*
 
 ### Tracked Limitations and Operational Prerequisites
