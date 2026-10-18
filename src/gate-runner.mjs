@@ -71,6 +71,11 @@ function evaluateGatePolicy({ setupError, verificationIncomplete, findings }) {
   };
 }
 
+function isEscapingRelative(rel) {
+  if (path.isAbsolute(rel)) return true;
+  return rel === '..' || rel.startsWith(`..${path.sep}`) || rel.startsWith('../') || rel.startsWith('..\\');
+}
+
 /**
  * Runs the end-to-end Bloat Checker gate evaluation pipeline per Sections 9, 10, and 11.
  *
@@ -378,8 +383,76 @@ export async function runGate(options = {}) {
 
     if (options.outputJson) {
       try {
-        const resolvedOutputPath = path.resolve(repositoryRoot, options.outputJson);
+        const resolvedRepo = path.resolve(repositoryRoot);
+        const resolvedOutputPath = path.resolve(resolvedRepo, options.outputJson);
+        const relCheck = path.relative(resolvedRepo, resolvedOutputPath);
+        if (isEscapingRelative(relCheck)) {
+          throw new Error(`Output JSON path '${options.outputJson}' escapes the repository root.`);
+        }
+
+        if (process.platform === 'win32') {
+          const pathWithoutDrive = resolvedOutputPath.replace(/^[a-zA-Z]:/, '');
+          if (pathWithoutDrive.includes(':')) {
+            throw new Error(`Output JSON path '${options.outputJson}' contains an invalid alternate data stream syntax.`);
+          }
+          const segments = pathWithoutDrive.split(/[\\/]/).filter(Boolean);
+          for (const seg of segments) {
+            const trimmed = seg.replace(/[\s.]+$/, '');
+            const stem = trimmed.split('.')[0].trim();
+            if (/^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9]|CLOCK\$)$/i.test(stem)) {
+              throw new Error(`Output JSON path '${options.outputJson}' contains a reserved Windows device name.`);
+            }
+          }
+        }
+
+        const realRepo = fs.realpathSync(resolvedRepo);
+
         const targetDir = path.dirname(resolvedOutputPath);
+        let checkDir = targetDir;
+        while (!fs.existsSync(checkDir) && checkDir !== path.dirname(checkDir)) {
+          checkDir = path.dirname(checkDir);
+        }
+        if (fs.existsSync(checkDir)) {
+          const realCheckDir = fs.realpathSync(checkDir);
+          const relReal = path.relative(realRepo, realCheckDir);
+          if (isEscapingRelative(relReal)) {
+            throw new Error(`Output JSON path '${options.outputJson}' resolves outside repository root via symlink.`);
+          }
+        }
+
+        let fileLstat = null;
+        try {
+          fileLstat = fs.lstatSync(resolvedOutputPath);
+        } catch (lstatErr) {
+          if (lstatErr.code !== 'ENOENT') {
+            throw new Error(`Failed to inspect output JSON path '${options.outputJson}': ${lstatErr.message}`);
+          }
+        }
+
+        if (fileLstat) {
+          if (fileLstat.isDirectory()) {
+            throw new Error(`Output JSON path '${options.outputJson}' is a directory.`);
+          }
+          try {
+            const realOutputFile = fs.realpathSync(resolvedOutputPath);
+            const relRealFile = path.relative(realRepo, realOutputFile);
+            if (isEscapingRelative(relRealFile)) {
+              throw new Error(`Output JSON path '${options.outputJson}' resolves outside repository root via symlink.`);
+            }
+          } catch (realFileErr) {
+            if (realFileErr.code === 'ENOENT' && fileLstat.isSymbolicLink()) {
+              const rawLinkTarget = fs.readlinkSync(resolvedOutputPath);
+              const resolvedLinkTarget = path.resolve(path.dirname(resolvedOutputPath), rawLinkTarget);
+              const relLink = path.relative(realRepo, resolvedLinkTarget);
+              if (isEscapingRelative(relLink)) {
+                throw new Error(`Output JSON path '${options.outputJson}' resolves outside repository root via symlink.`);
+              }
+            } else {
+              throw realFileErr;
+            }
+          }
+        }
+
         if (!fs.existsSync(targetDir)) {
           fs.mkdirSync(targetDir, { recursive: true });
         }

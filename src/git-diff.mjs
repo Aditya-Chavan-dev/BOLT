@@ -25,6 +25,138 @@ function finalizeFile(file) {
   });
 }
 
+function unquoteGitPath(str) {
+  if (!str) return '';
+  let s = str.trim();
+  if (s.startsWith('"') && s.endsWith('"') && s.length >= 2) {
+    s = s.slice(1, -1);
+  }
+  if (!s.includes('\\')) {
+    return s;
+  }
+  const bytes = [];
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] === '\\') {
+      i++;
+      if (i >= s.length) break;
+      const nextChar = s[i];
+      if (/[0-7]/.test(nextChar)) {
+        let octal = nextChar;
+        for (let j = 0; j < 2 && i + 1 < s.length && /[0-7]/.test(s[i + 1]); j++) {
+          i++;
+          octal += s[i];
+        }
+        bytes.push(parseInt(octal, 8));
+      } else {
+        switch (nextChar) {
+          case 'a': bytes.push(0x07); break;
+          case 'b': bytes.push(0x08); break;
+          case 't': bytes.push(0x09); break;
+          case 'n': bytes.push(0x0a); break;
+          case 'v': bytes.push(0x0b); break;
+          case 'f': bytes.push(0x0c); break;
+          case 'r': bytes.push(0x0d); break;
+          case '"': bytes.push(0x22); break;
+          case '\\': bytes.push(0x5c); break;
+          default: {
+            const charBuf = Buffer.from(nextChar, 'utf8');
+            for (const b of charBuf) bytes.push(b);
+            break;
+          }
+        }
+      }
+    } else {
+      const charBuf = Buffer.from(s[i], 'utf8');
+      for (const b of charBuf) bytes.push(b);
+    }
+  }
+  return Buffer.from(bytes).toString('utf8');
+}
+
+function parseDiffGitHeader(line) {
+  const rest = line.slice('diff --git '.length).trim();
+  if (rest.startsWith('"')) {
+    let endA = -1;
+    for (let i = 1; i < rest.length; i++) {
+      if (rest[i] === '"') {
+        let bs = 0;
+        for (let j = i - 1; j >= 0 && rest[j] === '\\'; j--) {
+          bs++;
+        }
+        if (bs % 2 === 0) {
+          endA = i;
+          break;
+        }
+      }
+    }
+    if (endA !== -1) {
+      const tokenA = rest.slice(0, endA + 1);
+      const restAfterA = rest.slice(endA + 1).trim();
+      let tokenB = restAfterA;
+      if (restAfterA.startsWith('"')) {
+        let endB = -1;
+        for (let i = 1; i < restAfterA.length; i++) {
+          if (restAfterA[i] === '"') {
+            let bs = 0;
+            for (let j = i - 1; j >= 0 && restAfterA[j] === '\\'; j--) {
+              bs++;
+            }
+            if (bs % 2 === 0) {
+              endB = i;
+              break;
+            }
+          }
+        }
+        if (endB !== -1) {
+          tokenB = restAfterA.slice(0, endB + 1);
+        }
+      }
+      const unquotedA = unquoteGitPath(tokenA);
+      const unquotedB = unquoteGitPath(tokenB);
+      const pathA = unquotedA.startsWith('a/') ? unquotedA.slice(2) : unquotedA;
+      const pathB = unquotedB.startsWith('b/') ? unquotedB.slice(2) : unquotedB;
+      return { pathA, pathB };
+    }
+  }
+
+  if (rest.endsWith('"')) {
+    let startB = -1;
+    for (let i = rest.length - 2; i >= 0; i--) {
+      if (rest[i] === '"') {
+        let bs = 0;
+        for (let j = i - 1; j >= 0 && rest[j] === '\\'; j--) {
+          bs++;
+        }
+        if (bs % 2 === 0 && (i === 0 || /\s/.test(rest[i - 1]))) {
+          startB = i;
+          break;
+        }
+      }
+    }
+    if (startB !== -1) {
+      const tokenA = rest.slice(0, startB).trim();
+      const tokenB = rest.slice(startB).trim();
+      const unquotedA = unquoteGitPath(tokenA);
+      const unquotedB = unquoteGitPath(tokenB);
+      const pathA = unquotedA.startsWith('a/') ? unquotedA.slice(2) : unquotedA;
+      const pathB = unquotedB.startsWith('b/') ? unquotedB.slice(2) : unquotedB;
+      return { pathA, pathB };
+    }
+  }
+
+  const bIndex = rest.indexOf(' b/');
+  if (bIndex !== -1 && rest.startsWith('a/')) {
+    return {
+      pathA: rest.slice(2, bIndex),
+      pathB: rest.slice(bIndex + 3),
+    };
+  }
+  const parts = rest.split(' ');
+  const rawPathB = parts[1] ? parts[1].replace(/^[b]\//, '') : '';
+  const rawPathA = parts[0] ? parts[0].replace(/^[a]\//, '') : '';
+  return { pathA: rawPathA, pathB: rawPathB };
+}
+
 /**
  * Parses raw unified diff output into deeply frozen structured file and line changes.
  *
@@ -50,14 +182,11 @@ function parseUnifiedDiff(diffText) {
         files.push(finalizeFile(currentFile));
       }
 
-      // Format: diff --git a/path b/path
-      const parts = line.slice('diff --git '.length).split(' ');
-      const rawPathB = parts[1] ? parts[1].replace(/^[b]\//, '') : '';
-      const rawPathA = parts[0] ? parts[0].replace(/^[a]\//, '') : '';
+      const { pathA, pathB } = parseDiffGitHeader(line);
 
       currentFile = {
-        path: rawPathB || rawPathA,
-        oldPath: null,
+        path: pathB || pathA,
+        oldPath: pathA || null,
         status: 'modified',
         isBinary: false,
         addedLines: [],
@@ -87,12 +216,36 @@ function parseUnifiedDiff(diffText) {
 
     if (line.startsWith('rename from ')) {
       currentFile.status = 'renamed';
-      currentFile.oldPath = line.slice('rename from '.length).trim();
+      currentFile.oldPath = unquoteGitPath(line.slice('rename from '.length).trim());
       continue;
     }
 
     if (line.startsWith('rename to ')) {
-      currentFile.path = line.slice('rename to '.length).trim();
+      currentFile.path = unquoteGitPath(line.slice('rename to '.length).trim());
+      continue;
+    }
+
+    if (line.startsWith('+++ ')) {
+      const rawTarget = line.slice(4).trim();
+      if (rawTarget !== '/dev/null') {
+        const unquoted = unquoteGitPath(rawTarget);
+        const clean = unquoted.startsWith('b/') ? unquoted.slice(2) : unquoted;
+        if (clean) {
+          currentFile.path = clean;
+        }
+      }
+      continue;
+    }
+
+    if (line.startsWith('--- ')) {
+      const rawSource = line.slice(4).trim();
+      if (rawSource !== '/dev/null') {
+        const unquoted = unquoteGitPath(rawSource);
+        const clean = unquoted.startsWith('a/') ? unquoted.slice(2) : unquoted;
+        if (clean) {
+          currentFile.oldPath = clean;
+        }
+      }
       continue;
     }
 
@@ -143,15 +296,15 @@ function parseUnifiedDiff(diffText) {
 
 function getUntrackedFiles(repositoryRoot) {
   try {
-    const rawOutput = execFileSync('git', ['ls-files', '--others', '--exclude-standard'], {
+    const rawOutput = execFileSync('git', ['ls-files', '-z', '--others', '--exclude-standard'], {
       cwd: repositoryRoot,
       stdio: ['pipe', 'pipe', 'pipe'],
       encoding: 'utf8',
     });
-    if (!rawOutput || rawOutput.trim().length === 0) {
+    if (!rawOutput || rawOutput.length === 0) {
       return Object.freeze([]);
     }
-    const files = rawOutput.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+    const files = rawOutput.split('\0').filter((s) => s.length > 0);
     return Object.freeze(files);
   } catch {
     return Object.freeze([]);
@@ -288,7 +441,7 @@ export function readGitDiff(options = {}) {
   }
 
   // 3. Assemble and execute diff command
-  const diffArgs = ['diff', '--no-color'];
+  const diffArgs = ['-c', 'core.quotepath=false', 'diff', '--no-color'];
   if (options.staged) {
     diffArgs.push('--cached');
   }

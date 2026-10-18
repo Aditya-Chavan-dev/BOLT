@@ -13,6 +13,7 @@ import { checkUnusedDependencies } from '../src/checks/unused-dependencies.mjs';
 import { generateFinding } from '../src/finding-generator.mjs';
 import { validateFindingEvidence } from '../src/finding-validator.mjs';
 import { runGate } from '../src/gate-runner.mjs';
+import { readGitDiff } from '../src/git-diff.mjs';
 import {
   formatHumanReport,
   formatJsonReport,
@@ -910,7 +911,7 @@ describe('Bloat Checker Behavioral Test Suite', () => {
       });
 
       const gateRes = await runGate({
-        repositoryRoot: 'g:/non-existent-directory-probe-404',
+        repositoryRoot: path.resolve(__dirname, 'non-existent-directory-probe-404'),
         findings: [findingWithCircularEvidence],
         json: true,
         silent: true,
@@ -1119,6 +1120,381 @@ describe('Bloat Checker Behavioral Test Suite', () => {
 
       assert.equal(childExitCode, 2, 'Failed report write must fail closed with exit code 2');
       assert.ok(childOutput.includes('Failed to write JSON report'));
+    });
+  });
+
+  // 13. Unit 14 Hardening — Containment, Quoted Filenames, and Schema Accuracy
+  describe('13. Unit 14 Hardening — Containment, Quoted Filenames, and Schema Accuracy', () => {
+    const hardenRepoDir = path.resolve(__dirname, '.temp-harden-repo');
+
+    let baselineCommitHash = '';
+
+    function cleanupHardenRepo() {
+      if (fs.existsSync(hardenRepoDir)) {
+        fs.rmSync(hardenRepoDir, { recursive: true, force: true });
+      }
+    }
+
+    function initHardenRepo() {
+      cleanupHardenRepo();
+      fs.mkdirSync(hardenRepoDir, { recursive: true });
+      execFileSync('git', ['init', '-b', 'main'], { cwd: hardenRepoDir });
+      execFileSync('git', ['config', 'user.name', 'Hardening Runner'], { cwd: hardenRepoDir });
+      execFileSync('git', ['config', 'user.email', 'hardening@example.com'], { cwd: hardenRepoDir });
+
+      const basePkg = {
+        name: 'harden-test-app',
+        version: '1.0.0',
+        dependencies: {
+          'used-lib': '^1.0.0',
+          'unused-lib': '^1.0.0',
+        },
+      };
+      fs.writeFileSync(path.join(hardenRepoDir, 'package.json'), JSON.stringify(basePkg, null, 2));
+      fs.mkdirSync(path.join(hardenRepoDir, 'src'), { recursive: true });
+      fs.writeFileSync(
+        path.join(hardenRepoDir, 'src/index.js'),
+        "import { helper } from 'used-lib';\nexport const ok = true;\n"
+      );
+      execFileSync('git', ['add', '.'], { cwd: hardenRepoDir });
+      execFileSync('git', ['commit', '-m', 'Initial commit'], { cwd: hardenRepoDir });
+      baselineCommitHash = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: hardenRepoDir, encoding: 'utf8' }).trim();
+    }
+
+    function resetToBaseline() {
+      if (baselineCommitHash) {
+        execFileSync('git', ['reset', '--hard', baselineCommitHash], { cwd: hardenRepoDir });
+        execFileSync('git', ['clean', '-fd'], { cwd: hardenRepoDir });
+      }
+    }
+
+    before(() => {
+      initHardenRepo();
+    });
+
+    after(() => {
+      cleanupHardenRepo();
+    });
+
+    it('fails closed with exit code 2 when --output-json escapes repository root via traversal (../)', async () => {
+      const outsideCanary = path.resolve(hardenRepoDir, '../escaped-canary.json');
+      fs.writeFileSync(outsideCanary, 'CANARY_ORIGINAL');
+
+      const res = await runGate({
+        repositoryRoot: hardenRepoDir,
+        outputJson: '../escaped-canary.json',
+        silent: true,
+      });
+      assert.equal(res.success, false);
+      assert.equal(res.exitCode, EXIT_CODES.VERIFICATION_FAILURE);
+      assert.ok(res.errors.some((e) => e.includes('escapes the repository root')));
+      assert.equal(fs.readFileSync(outsideCanary, 'utf8'), 'CANARY_ORIGINAL');
+
+      if (fs.existsSync(outsideCanary)) fs.unlinkSync(outsideCanary);
+    });
+
+    it('fails closed with exit code 2 when --output-json specifies absolute path outside repository root', async () => {
+      const outsidePath = path.resolve(hardenRepoDir, '../outside-abs-report.json');
+      fs.writeFileSync(outsidePath, 'CANARY_ORIGINAL');
+
+      const res = await runGate({
+        repositoryRoot: hardenRepoDir,
+        outputJson: outsidePath,
+        silent: true,
+      });
+      assert.equal(res.success, false);
+      assert.equal(res.exitCode, EXIT_CODES.VERIFICATION_FAILURE);
+      assert.ok(res.errors.some((e) => e.includes('escapes the repository root')));
+      assert.equal(fs.readFileSync(outsidePath, 'utf8'), 'CANARY_ORIGINAL');
+
+      if (fs.existsSync(outsidePath)) fs.unlinkSync(outsidePath);
+    });
+
+    it('fails closed with exit code 2 when --output-json parent directory resolves outside repository via junction/symlink', async () => {
+      const outsideTargetDir = path.resolve(hardenRepoDir, '../outside-target-junction');
+      fs.mkdirSync(outsideTargetDir, { recursive: true });
+      const canaryFile = path.join(outsideTargetDir, 'canary.json');
+      fs.writeFileSync(canaryFile, 'CANARY_ORIGINAL');
+
+      const junctionLink = path.join(hardenRepoDir, 'link-outside-dir');
+      fs.symlinkSync(outsideTargetDir, junctionLink, 'junction');
+
+      const res = await runGate({
+        repositoryRoot: hardenRepoDir,
+        outputJson: 'link-outside-dir/nested/escaped-report.json',
+        silent: true,
+      });
+
+      assert.equal(res.success, false);
+      assert.equal(res.exitCode, EXIT_CODES.VERIFICATION_FAILURE);
+      assert.ok(res.errors.some((e) => e.includes('resolves outside repository root via symlink')));
+      assert.equal(fs.readFileSync(canaryFile, 'utf8'), 'CANARY_ORIGINAL');
+      assert.ok(!fs.existsSync(path.join(outsideTargetDir, 'nested/escaped-report.json')));
+
+      if (fs.existsSync(junctionLink)) fs.unlinkSync(junctionLink);
+      if (fs.existsSync(outsideTargetDir)) fs.rmSync(outsideTargetDir, { recursive: true, force: true });
+    });
+
+    it('fails closed with exit code 2 when --output-json is a symlink resolving outside repository root', async () => {
+      const outsideTargetFile = path.resolve(hardenRepoDir, '../outside-victim.json');
+      fs.writeFileSync(outsideTargetFile, 'VICTIM_CANARY_ORIGINAL');
+
+      const symlinkInRepo = path.join(hardenRepoDir, 'symlinked-victim.json');
+      let linkCreated = false;
+      try {
+        fs.symlinkSync(outsideTargetFile, symlinkInRepo, 'file');
+        linkCreated = true;
+      } catch {
+        // Creating file symlinks on Windows requires developer mode or elevated privilege
+      }
+
+      if (linkCreated) {
+        const res = await runGate({
+          repositoryRoot: hardenRepoDir,
+          outputJson: 'symlinked-victim.json',
+          silent: true,
+        });
+
+        assert.equal(res.success, false);
+        assert.equal(res.exitCode, EXIT_CODES.VERIFICATION_FAILURE);
+        assert.ok(res.errors.some((e) => e.includes('resolves outside repository root')));
+        assert.equal(fs.readFileSync(outsideTargetFile, 'utf8'), 'VICTIM_CANARY_ORIGINAL');
+
+        if (fs.existsSync(symlinkInRepo)) fs.unlinkSync(symlinkInRepo);
+      }
+      if (fs.existsSync(outsideTargetFile)) fs.unlinkSync(outsideTargetFile);
+    });
+
+    if (process.platform === 'win32') {
+      it('fails closed with exit code 2 when --output-json uses Windows reserved device names, variants, or ADS', async () => {
+        const devRes = await runGate({
+          repositoryRoot: hardenRepoDir,
+          outputJson: 'NUL',
+          silent: true,
+        });
+        assert.equal(devRes.success, false);
+        assert.equal(devRes.exitCode, EXIT_CODES.VERIFICATION_FAILURE);
+        assert.ok(devRes.errors.some((e) => e.includes('reserved Windows device name')));
+
+        const devVariantRes = await runGate({
+          repositoryRoot: hardenRepoDir,
+          outputJson: 'NUL .txt',
+          silent: true,
+        });
+        assert.equal(devVariantRes.success, false);
+        assert.equal(devVariantRes.exitCode, EXIT_CODES.VERIFICATION_FAILURE);
+        assert.ok(devVariantRes.errors.some((e) => e.includes('reserved Windows device name')));
+
+        const devDirRes = await runGate({
+          repositoryRoot: hardenRepoDir,
+          outputJson: 'aux/report.json',
+          silent: true,
+        });
+        assert.equal(devDirRes.success, false);
+        assert.equal(devDirRes.exitCode, EXIT_CODES.VERIFICATION_FAILURE);
+        assert.ok(devDirRes.errors.some((e) => e.includes('reserved Windows device name')));
+
+        const adsRes = await runGate({
+          repositoryRoot: hardenRepoDir,
+          outputJson: 'report.json:stream',
+          silent: true,
+        });
+        assert.equal(adsRes.success, false);
+        assert.equal(adsRes.exitCode, EXIT_CODES.VERIFICATION_FAILURE);
+        assert.ok(adsRes.errors.some((e) => e.includes('invalid alternate data stream syntax')));
+      });
+    }
+
+    it('succeeds with exit code 0 when --output-json is a valid relative path within repository root', async () => {
+      const reportFile = 'valid-report.json';
+      const fullReportPath = path.join(hardenRepoDir, reportFile);
+      if (fs.existsSync(fullReportPath)) fs.unlinkSync(fullReportPath);
+
+      const res = await runGate({
+        repositoryRoot: hardenRepoDir,
+        outputJson: reportFile,
+        silent: true,
+      });
+      assert.equal(res.exitCode, EXIT_CODES.SUCCESS);
+      assert.ok(fs.existsSync(fullReportPath));
+      if (fs.existsSync(fullReportPath)) fs.unlinkSync(fullReportPath);
+    });
+
+    it('succeeds with exit code 0 when --output-json is a nested relative path within repository root', async () => {
+      const reportRel = 'reports/deep/nested-report.json';
+      const fullReportPath = path.join(hardenRepoDir, reportRel);
+      if (fs.existsSync(fullReportPath)) fs.unlinkSync(fullReportPath);
+
+      const res = await runGate({
+        repositoryRoot: hardenRepoDir,
+        outputJson: reportRel,
+        silent: true,
+      });
+      assert.equal(res.exitCode, EXIT_CODES.SUCCESS);
+      assert.ok(fs.existsSync(fullReportPath));
+      if (fs.existsSync(fullReportPath)) fs.unlinkSync(fullReportPath);
+    });
+
+    it('succeeds with exit code 0 when --output-json is an absolute path within repository root', async () => {
+      const fullReportPath = path.join(hardenRepoDir, 'in-tree-report.json');
+      if (fs.existsSync(fullReportPath)) fs.unlinkSync(fullReportPath);
+
+      const res = await runGate({
+        repositoryRoot: hardenRepoDir,
+        outputJson: fullReportPath,
+        silent: true,
+      });
+      assert.equal(res.exitCode, EXIT_CODES.SUCCESS);
+      assert.ok(fs.existsSync(fullReportPath));
+      if (fs.existsSync(fullReportPath)) fs.unlinkSync(fullReportPath);
+    });
+
+    it('succeeds with exit code 0 when --output-json directory begins with double dots without escaping (..reports/report.json)', async () => {
+      const dotReportRel = '..reports/report.json';
+      const fullDotReportPath = path.join(hardenRepoDir, dotReportRel);
+      if (fs.existsSync(fullDotReportPath)) fs.unlinkSync(fullDotReportPath);
+
+      const res = await runGate({
+        repositoryRoot: hardenRepoDir,
+        outputJson: dotReportRel,
+        silent: true,
+      });
+      assert.equal(res.exitCode, EXIT_CODES.SUCCESS);
+      assert.ok(fs.existsSync(fullDotReportPath));
+      if (fs.existsSync(fullDotReportPath)) fs.unlinkSync(fullDotReportPath);
+      const dotDir = path.dirname(fullDotReportPath);
+      if (fs.existsSync(dotDir)) fs.rmdirSync(dotDir);
+    });
+
+    it('parses git diff containing filenames with spaces without truncating path', () => {
+      const spaceFilePath = path.join(hardenRepoDir, 'src/my component with spaces.js');
+      fs.writeFileSync(spaceFilePath, 'export const spaced = true;\n');
+      execFileSync('git', ['add', spaceFilePath], { cwd: hardenRepoDir });
+
+      const diffResult = readGitDiff({
+        repositoryRoot: hardenRepoDir,
+        staged: true,
+      });
+
+      assert.equal(diffResult.success, true);
+      const found = diffResult.changedFiles.find(
+        (f) => f.path === 'src/my component with spaces.js'
+      );
+      assert.ok(found, "File 'src/my component with spaces.js' must be parsed with full path intact");
+      assert.equal(found.addedLines.length, 1);
+      assert.equal(found.addedLines[0].content, 'export const spaced = true;');
+
+      execFileSync('git', ['reset', 'HEAD', spaceFilePath], { cwd: hardenRepoDir });
+      if (fs.existsSync(spaceFilePath)) fs.unlinkSync(spaceFilePath);
+    });
+
+    it('parses git diff containing renamed filenames with spaces', () => {
+      const origFile = path.join(hardenRepoDir, 'src/file-to-rename.js');
+      fs.writeFileSync(origFile, 'export const renameMe = 1;\n');
+      execFileSync('git', ['add', origFile], { cwd: hardenRepoDir });
+      execFileSync('git', ['commit', '-m', 'Add rename source'], { cwd: hardenRepoDir });
+
+      const renamedFile = 'src/renamed file with spaces.js';
+      execFileSync('git', ['mv', 'src/file-to-rename.js', renamedFile], { cwd: hardenRepoDir });
+
+      const diffResult = readGitDiff({
+        repositoryRoot: hardenRepoDir,
+        staged: true,
+      });
+
+      assert.equal(diffResult.success, true);
+      const found = diffResult.changedFiles.find((f) => f.path === renamedFile);
+      assert.ok(found, `File '${renamedFile}' must be parsed with status 'renamed'`);
+      assert.equal(found.status, 'renamed');
+      assert.equal(found.oldPath, 'src/file-to-rename.js');
+
+      resetToBaseline();
+    });
+
+    it('parses git diff containing non-ASCII UTF-8 filenames with core.quotepath enabled', () => {
+      execFileSync('git', ['config', 'core.quotepath', 'true'], { cwd: hardenRepoDir });
+      const cafeFile = path.join(hardenRepoDir, 'src/café-module.js');
+      fs.writeFileSync(cafeFile, 'export const cafe = true;\n');
+      execFileSync('git', ['add', cafeFile], { cwd: hardenRepoDir });
+
+      const diffResult = readGitDiff({
+        repositoryRoot: hardenRepoDir,
+        staged: true,
+      });
+
+      assert.equal(diffResult.success, true);
+      const found = diffResult.changedFiles.find((f) => f.path === 'src/café-module.js');
+      assert.ok(found, "File 'src/café-module.js' must be parsed with full path and exact UTF-8 characters intact");
+      assert.equal(found.addedLines.length, 1);
+
+      execFileSync('git', ['commit', '-m', 'Add cafe module'], { cwd: hardenRepoDir });
+      const renamedCafe = 'src/café-renamed.js';
+      execFileSync('git', ['mv', 'src/café-module.js', renamedCafe], { cwd: hardenRepoDir });
+
+      const renameResult = readGitDiff({
+        repositoryRoot: hardenRepoDir,
+        staged: true,
+      });
+
+      assert.equal(renameResult.success, true);
+      const renamedFound = renameResult.changedFiles.find((f) => f.path === renamedCafe);
+      assert.ok(renamedFound, `File '${renamedCafe}' must be parsed with status 'renamed'`);
+      assert.equal(renamedFound.status, 'renamed');
+      assert.equal(renamedFound.oldPath, 'src/café-module.js');
+
+      resetToBaseline();
+    });
+
+    it('enumerates untracked files with non-ASCII and special characters using NUL delimiter', () => {
+      const untrackedCafeFile = path.join(hardenRepoDir, 'untracked-café.txt');
+      fs.writeFileSync(untrackedCafeFile, 'untracked cafe text\n');
+
+      const diffResult = readGitDiff({
+        repositoryRoot: hardenRepoDir,
+        includeUntracked: true,
+      });
+
+      assert.equal(diffResult.success, true);
+      assert.ok(
+        diffResult.untrackedFiles.includes('untracked-café.txt'),
+        'untrackedFiles must contain unquoted non-ASCII name'
+      );
+      const foundObj = diffResult.changedFiles.find((f) => f.path === 'untracked-café.txt');
+      assert.ok(foundObj, 'changedFiles must contain untracked non-ASCII file');
+      assert.equal(foundObj.status, 'untracked');
+
+      if (fs.existsSync(untrackedCafeFile)) fs.unlinkSync(untrackedCafeFile);
+    });
+
+    it('extracts package name from finding.explanation when details is omitted (schema conformance)', () => {
+      const schemaConformingFinding = createBaseFinding({
+        title: 'RULE-NO-UNNECESSARY-DEPENDENCIES',
+        explanation: "Package 'used-lib' was added to production dependencies with zero references.",
+        evidence: '"used-lib"',
+      });
+      delete schemaConformingFinding.details;
+
+      const res = validateFindingEvidence(schemaConformingFinding, { repositoryRoot: hardenRepoDir });
+      assert.equal(res.status, FINDING_STATUSES.UNVERIFIED);
+      assert.ok(res.rejectionReason.includes('referenced in'));
+    });
+
+    it('confirms verified blocking violation when package name is in explanation without details', () => {
+      const schemaConformingUnused = createBaseFinding({
+        title: 'RULE-NO-UNNECESSARY-DEPENDENCIES',
+        explanation: "Package 'unused-lib' was added to production dependencies with zero references.",
+        location: {
+          filePath: 'package.json',
+          lineRange: { start: 6, end: 6 },
+        },
+        evidence: '"unused-lib"',
+      });
+      delete schemaConformingUnused.details;
+
+      const res = validateFindingEvidence(schemaConformingUnused, { repositoryRoot: hardenRepoDir });
+      assert.equal(res.status, FINDING_STATUSES.VERIFIED);
+      assert.equal(res.valid, true);
+      assert.equal(res.finding.blocksWorkflow, true);
     });
   });
 });

@@ -342,11 +342,12 @@ export function validateFindingEvidence(finding, context = {}) {
                 ? finding.evidence.excerpt.trim()
                 : '';
 
+          const explanationText = (finding.explanation || finding.details || '').trim();
           const depMatch =
             (evidenceStr && evidenceStr.match(/["'](@?[a-zA-Z0-9_.-]+(?:\/[a-zA-Z0-9_.-]+)?)["']:\s*["'][^"']+["']/)) ||
             (evidenceStr && evidenceStr.match(/^["'](@?[a-zA-Z0-9_.-]+(?:\/[a-zA-Z0-9_.-]+)?)["']:/)) ||
             (finding.title && finding.title.match(/[:\s](@?[a-zA-Z0-9_.-]+(?:\/[a-zA-Z0-9_.-]+)?)$/)) ||
-            (finding.details && finding.details.match(/Package ['"](@?[a-zA-Z0-9_.-]+(?:\/[a-zA-Z0-9_.-]+)?)['"]/));
+            (explanationText && explanationText.match(/Package ['"](@?[a-zA-Z0-9_.-]+(?:\/[a-zA-Z0-9_.-]+)?)['"]/));
 
           const pkgName = depMatch ? depMatch[1] : null;
 
