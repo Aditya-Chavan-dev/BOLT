@@ -163,7 +163,7 @@ function parseDiffGitHeader(line) {
  * @param {string} diffText - Raw git diff output.
  * @returns {ReadonlyArray<object>} Structured changed files.
  */
-function parseUnifiedDiff(diffText) {
+export function parseUnifiedDiff(diffText) {
   if (!diffText || typeof diffText !== 'string' || diffText.trim().length === 0) {
     return Object.freeze([]);
   }
@@ -502,3 +502,186 @@ export function readGitDiff(options = {}) {
     errors: Object.freeze([]),
   });
 }
+
+/**
+ * Parses directly supplied unified diff text into a diffResult structure without invoking Git CLI.
+ *
+ * @param {string} diffText - Raw unified diff text.
+ * @returns {object} Deeply frozen diff result.
+ */
+export function parseDirectDiff(diffText) {
+  if (typeof diffText !== 'string') {
+    return Object.freeze({
+      success: false,
+      diffText: '',
+      base: null,
+      changedFiles: Object.freeze([]),
+      untrackedFiles: Object.freeze([]),
+      warnings: Object.freeze([]),
+      errors: Object.freeze(['Parameter diff must be a string containing unified diff content.']),
+    });
+  }
+
+  const trimmed = diffText.trim();
+  if (trimmed.length === 0) {
+    return Object.freeze({
+      success: true,
+      diffText: '',
+      base: null,
+      changedFiles: Object.freeze([]),
+      untrackedFiles: Object.freeze([]),
+      warnings: Object.freeze(['Direct diff input is empty: zero file modifications provided.']),
+      errors: Object.freeze([]),
+    });
+  }
+
+  try {
+    const changedFiles = parseUnifiedDiff(diffText);
+    const warnings = [];
+    if (changedFiles.length === 0) {
+      warnings.push('No valid unified diff hunks found in the provided diff text.');
+    }
+    return Object.freeze({
+      success: true,
+      diffText,
+      base: null,
+      isDirectDiff: true,
+      changedFiles,
+      untrackedFiles: Object.freeze([]),
+      warnings: Object.freeze(warnings),
+      errors: Object.freeze([]),
+    });
+  } catch (err) {
+    return Object.freeze({
+      success: false,
+      diffText,
+      base: null,
+      changedFiles: Object.freeze([]),
+      untrackedFiles: Object.freeze([]),
+      warnings: Object.freeze([]),
+      errors: Object.freeze([`Failed to parse unified diff: ${err.message}`]),
+    });
+  }
+}
+
+/**
+ * Extracts unified diff lines for a specific file path from diff text.
+ *
+ * @param {string} diffText
+ * @param {string} targetFilePath
+ * @returns {Array<string>}
+ */
+export function extractFileDiffLines(diffText, targetFilePath) {
+  if (!diffText || typeof diffText !== 'string') return [];
+  const lines = diffText.split(/\r?\n/);
+  const targetNorm = targetFilePath.replace(/\\/g, '/');
+  let inTargetFile = false;
+  const fileLines = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.startsWith('diff --git ')) {
+      const { pathA, pathB } = parseDiffGitHeader(line);
+      const curPath = (pathB || pathA || '').replace(/\\/g, '/');
+      if (curPath === targetNorm || curPath.endsWith('/' + targetNorm)) {
+        inTargetFile = true;
+      } else {
+        inTargetFile = false;
+      }
+      continue;
+    }
+
+    if (inTargetFile) {
+      fileLines.push(line);
+    }
+  }
+
+  // Handle diffs without "diff --git" prefix (e.g. plain patch starting with --- / +++)
+  if (fileLines.length === 0) {
+    let simpleMatch = false;
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (line.startsWith('--- ')) {
+        const p = line.slice(4).trim().replace(/^[ab]\//, '').replace(/\\/g, '/');
+        simpleMatch = p === targetNorm || p.endsWith('/' + targetNorm);
+      } else if (line.startsWith('+++ ')) {
+        const p = line.slice(4).trim().replace(/^[ab]\//, '').replace(/\\/g, '/');
+        if (p === targetNorm || p.endsWith('/' + targetNorm)) {
+          simpleMatch = true;
+        }
+      } else if (simpleMatch) {
+        fileLines.push(line);
+      }
+    }
+  }
+
+  return fileLines;
+}
+
+/**
+ * Applies unified diff hunk lines to base text in memory without disk mutations.
+ *
+ * @param {string|null} baseText - Original content before patch (or empty/null if new file).
+ * @param {Array<string>} diffLines - Lines of the unified diff for this file.
+ * @returns {{ success: boolean, text?: string, error?: string }}
+ */
+export function applyUnifiedDiffToText(baseText, diffLines) {
+  const baseLines = typeof baseText === 'string' && baseText.length > 0
+    ? baseText.split(/\r?\n/)
+    : [];
+  const resultLines = [];
+  let baseIndex = 0;
+  let inHunk = false;
+
+  for (let i = 0; i < diffLines.length; i++) {
+    const line = diffLines[i];
+    if (line.startsWith('@@ ')) {
+      const hunk = parseHunkHeader(line);
+      if (!hunk) {
+        return { success: false, error: `Malformed hunk header in diff: ${line}` };
+      }
+      const targetBaseIndex = hunk.oldStart === 0 ? 0 : hunk.oldStart - 1;
+
+      if (targetBaseIndex < baseIndex) {
+        return { success: false, error: 'Hunks out of sequence or overlapping in diff.' };
+      }
+
+      while (baseIndex < targetBaseIndex && baseIndex < baseLines.length) {
+        resultLines.push(baseLines[baseIndex]);
+        baseIndex++;
+      }
+      inHunk = true;
+      continue;
+    }
+
+    if (!inHunk) {
+      continue;
+    }
+
+    if (line.startsWith('+') && !line.startsWith('+++')) {
+      resultLines.push(line.slice(1));
+    } else if (line.startsWith('-') && !line.startsWith('---')) {
+      if (baseIndex >= baseLines.length) {
+        return { success: false, error: 'Deleted line in diff extends beyond base file bounds.' };
+      }
+      baseIndex++;
+    } else if (line.startsWith(' ')) {
+      if (baseIndex >= baseLines.length) {
+        return { success: false, error: 'Context line in diff extends beyond base file bounds.' };
+      }
+      resultLines.push(baseLines[baseIndex]);
+      baseIndex++;
+    } else if (line.startsWith('\\')) {
+      // Ignore "\ No newline at end of file"
+      continue;
+    }
+  }
+
+  while (baseIndex < baseLines.length) {
+    resultLines.push(baseLines[baseIndex]);
+    baseIndex++;
+  }
+
+  return { success: true, text: resultLines.join('\n') };
+}
+
