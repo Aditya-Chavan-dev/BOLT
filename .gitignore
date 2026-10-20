@@ -1,6 +1,13 @@
 # Dependencies
 node_modules/
 
+# Generated Reports & Test Artifacts
+bloat-report.json
+coverage/
+.nyc_output/
+.temp-*/
+*.tmp
+
 # Logs
 logs/
 *.log
@@ -9,18 +16,23 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
-# Test coverage & generated artifacts
-coverage/
-.nyc_output/
-bloat-report.json
-.temp-*/
-*.tmp
+# Local Specifications & Asset Drafts (kept on PC, not tracked in repo)
+BLOAT_CHECKER_DISCUSSION.md
+BLOAT_CHECKER_V1_BUILD_SPEC.md
+assets/Bolt 1.png
 
-# Environment & local secrets
+# Local Environment & Secrets
 .env
 .env.*
 !.env.example
 
-# Operating System files
+# IDE & Editor Settings
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Operating System Files
 .DS_Store
 Thumbs.db
+desktop.ini
