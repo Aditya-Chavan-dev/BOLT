@@ -3,6 +3,12 @@ import path from 'node:path';
 import { SEVERITIES, FINDING_STATUSES } from './severities.mjs';
 import { validateFinding } from './finding-schema.mjs';
 import { UNIVERSAL_RULES } from './universal-rules.mjs';
+import {
+  getEffectivePackageJson,
+  getEffectiveSourceContents,
+  isPackageReferenced,
+  stripComments,
+} from './checks/unused-dependencies.mjs';
 
 const INSUFFICIENT_EVIDENCE_PATTERNS = [
   /^ai says this is bad$/i,
@@ -119,7 +125,8 @@ function isPackageReferencedInCodebase(packageName, repositoryRoot) {
     if (IGNORED_FILES.has(basename)) continue;
     try {
       const content = fs.readFileSync(file, 'utf8');
-      if (refRegex.test(content)) {
+      const cleanContent = stripComments(content);
+      if (refRegex.test(cleanContent)) {
         return { referenced: true, file };
       }
     } catch {
@@ -185,100 +192,152 @@ export function validateFindingEvidence(finding, context = {}) {
     status = FINDING_STATUSES.VERIFICATION_INCOMPLETE;
     rejectionReason = `Cited file path '${relPath}' escapes the repository root. External file citations are invalid.`;
     errors.push(rejectionReason);
-  } else if (!fs.existsSync(fullPath)) {
-    challengePassed = false;
-    status = FINDING_STATUSES.VERIFICATION_INCOMPLETE;
-    rejectionReason = `Cited file '${relPath}' does not exist in the reviewed revision.`;
-    errors.push(rejectionReason);
   } else {
-    // Check symlink containment where supported
-    let realFullPath = fullPath;
-    let realRepo = resolvedRepo;
-    let symlinkEscapes = false;
-    try {
-      realFullPath = fs.realpathSync(fullPath);
-      realRepo = fs.realpathSync(resolvedRepo);
-      const relRealCheck = path.relative(realRepo, realFullPath);
-      if (relRealCheck.startsWith('..') || path.isAbsolute(relRealCheck)) {
-        symlinkEscapes = true;
-      }
-    } catch {
-      symlinkEscapes = true;
-    }
+    const diffFile = context.diffResult?.changedFiles?.find((f) => f.path === relPath);
+    const fileExistsOnDisk = fs.existsSync(fullPath);
 
-    if (symlinkEscapes) {
+    if (!fileExistsOnDisk && !diffFile) {
       challengePassed = false;
       status = FINDING_STATUSES.VERIFICATION_INCOMPLETE;
-      rejectionReason = `Cited file path '${relPath}' resolves outside repository root via symlink.`;
+      rejectionReason = `Cited file '${relPath}' does not exist in the reviewed revision.`;
       errors.push(rejectionReason);
     } else {
-      // Read file and verify line citations and evidence content
-      try {
-        const fileContent = fs.readFileSync(fullPath, 'utf8');
-        const lines = fileContent.split(/\r?\n/);
-        const totalLines = lines.length;
+      // Check symlink containment where supported
+      let realFullPath = fullPath;
+      let realRepo = resolvedRepo;
+      let symlinkEscapes = false;
+      if (fileExistsOnDisk) {
+        try {
+          realFullPath = fs.realpathSync(fullPath);
+          realRepo = fs.realpathSync(resolvedRepo);
+          const relRealCheck = path.relative(realRepo, realFullPath);
+          if (relRealCheck.startsWith('..') || path.isAbsolute(relRealCheck)) {
+            symlinkEscapes = true;
+          }
+        } catch {
+          symlinkEscapes = true;
+        }
+      }
 
-        if (finding.location.lineRange && typeof finding.location.lineRange === 'object') {
-          const { start, end } = finding.location.lineRange;
-
-          if (start > totalLines) {
-            challengePassed = false;
-            status = FINDING_STATUSES.VERIFICATION_INCOMPLETE;
-            rejectionReason = `Cited start line (${start}) exceeds total line count (${totalLines}) in '${relPath}'. Stale or invalid line reference.`;
-            errors.push(rejectionReason);
-          } else if (end > totalLines) {
-            challengePassed = false;
-            status = FINDING_STATUSES.VERIFICATION_INCOMPLETE;
-            rejectionReason = `Cited end line (${end}) exceeds total line count (${totalLines}) in '${relPath}'. Stale or invalid line reference.`;
-            errors.push(rejectionReason);
-          } else {
-            // Substantive evidence excerpt verification against actual lines
-            const citedLines = lines.slice(start - 1, end).join('\n');
+      if (symlinkEscapes) {
+        challengePassed = false;
+        status = FINDING_STATUSES.VERIFICATION_INCOMPLETE;
+        rejectionReason = `Cited file path '${relPath}' resolves outside repository root via symlink.`;
+        errors.push(rejectionReason);
+      } else {
+        // Read file and verify line citations and evidence content
+        try {
+          let fileContent = '';
+          let lines = [];
+          if (fileExistsOnDisk && !context.diffResult?.isDirectDiff) {
+            fileContent = fs.readFileSync(fullPath, 'utf8');
+            lines = fileContent.split(/\r?\n/);
+          } else if (context.diffResult?.isDirectDiff && fileExistsOnDisk) {
+            fileContent = fs.readFileSync(fullPath, 'utf8');
+            lines = fileContent.split(/\r?\n/);
             const excerpt =
               typeof finding.evidence === 'string'
                 ? finding.evidence.trim()
                 : (finding.evidence && typeof finding.evidence.excerpt === 'string')
                   ? finding.evidence.excerpt.trim()
                   : null;
-
             if (excerpt && !isGenericEvidence(excerpt)) {
-              const normCited = normalizeSnippet(citedLines);
-              const normExcerpt = normalizeSnippet(excerpt);
-              const matchesCited = normCited.includes(normExcerpt) || normExcerpt.includes(normCited);
-
-              if (!matchesCited) {
-                challengePassed = false;
-                status = FINDING_STATUSES.VERIFICATION_INCOMPLETE;
-                rejectionReason = `Cited evidence excerpt does not match actual file contents at lines ${start}-${end} in '${relPath}'. Stale or fabricated citation.`;
-                errors.push(rejectionReason);
+              const cited = (finding.location?.lineRange && lines[finding.location.lineRange.start - 1]) || fileContent;
+              if (!normalizeSnippet(cited).includes(normalizeSnippet(excerpt))) {
+                if (diffFile && Array.isArray(diffFile.addedLines)) {
+                  const maxLine = diffFile.addedLines.reduce((max, l) => Math.max(max, l.line || 0), lines.length);
+                  const diffLinesArr = [...lines];
+                  while (diffLinesArr.length < maxLine) diffLinesArr.push('');
+                  for (const l of diffFile.addedLines) {
+                    if (l.line > 0) {
+                      diffLinesArr[l.line - 1] = l.content;
+                    }
+                  }
+                  lines = diffLinesArr;
+                  fileContent = lines.join('\n');
+                }
+              }
+            }
+          } else if (diffFile && Array.isArray(diffFile.addedLines)) {
+            fileContent = diffFile.addedLines.map((l) => l.content).join('\n');
+            const maxLine = diffFile.addedLines.reduce((max, l) => Math.max(max, l.line || 0), 0);
+            lines = new Array(maxLine).fill('');
+            for (const l of diffFile.addedLines) {
+              if (l.line > 0) {
+                lines[l.line - 1] = l.content;
               }
             }
           }
-        } else {
-          // No line range given: if excerpt provided, verify it exists anywhere in the file
-          const excerpt =
-            typeof finding.evidence === 'string'
-              ? finding.evidence.trim()
-              : (finding.evidence && typeof finding.evidence.excerpt === 'string')
-                ? finding.evidence.excerpt.trim()
-                : null;
+          const totalLines = lines.length;
 
-          if (excerpt && !isGenericEvidence(excerpt)) {
-            const normContent = normalizeSnippet(fileContent);
-            const normExcerpt = normalizeSnippet(excerpt);
-            if (!normContent.includes(normExcerpt)) {
-              challengePassed = false;
-              status = FINDING_STATUSES.VERIFICATION_INCOMPLETE;
-              rejectionReason = `Cited evidence excerpt was not found in '${relPath}'. Stale or fabricated citation.`;
-              errors.push(rejectionReason);
+          const isAdvisoryMetricRule =
+            finding.rule?.id === 'RULE-GOAL-ALIGNMENT' ||
+            finding.rule?.id === 'RULE-TEST-ADEQUACY';
+
+          if (!isAdvisoryMetricRule) {
+            if (finding.location.lineRange && typeof finding.location.lineRange === 'object') {
+              const { start, end } = finding.location.lineRange;
+
+              if (start > totalLines) {
+                challengePassed = false;
+                status = FINDING_STATUSES.VERIFICATION_INCOMPLETE;
+                rejectionReason = `Cited start line (${start}) exceeds total line count (${totalLines}) in '${relPath}'. Stale or invalid line reference.`;
+                errors.push(rejectionReason);
+              } else if (end > totalLines) {
+                challengePassed = false;
+                status = FINDING_STATUSES.VERIFICATION_INCOMPLETE;
+                rejectionReason = `Cited end line (${end}) exceeds total line count (${totalLines}) in '${relPath}'. Stale or invalid line reference.`;
+                errors.push(rejectionReason);
+              } else {
+                // Substantive evidence excerpt verification against actual lines
+                const citedLines = lines.slice(start - 1, end).join('\n');
+                const excerpt =
+                  typeof finding.evidence === 'string'
+                    ? finding.evidence.trim()
+                    : (finding.evidence && typeof finding.evidence.excerpt === 'string')
+                      ? finding.evidence.excerpt.trim()
+                      : null;
+
+                if (excerpt && !isGenericEvidence(excerpt)) {
+                  const normCited = normalizeSnippet(citedLines);
+                  const normExcerpt = normalizeSnippet(excerpt);
+                  const matchesCited = normCited.includes(normExcerpt) || normExcerpt.includes(normCited);
+
+                  if (!matchesCited) {
+                    challengePassed = false;
+                    status = FINDING_STATUSES.VERIFICATION_INCOMPLETE;
+                    rejectionReason = `Cited evidence excerpt does not match actual file contents at lines ${start}-${end} in '${relPath}'. Stale or fabricated citation.`;
+                    errors.push(rejectionReason);
+                  }
+                }
+              }
+            } else {
+              // No line range given: if excerpt provided, verify it exists anywhere in the file
+              const excerpt =
+                typeof finding.evidence === 'string'
+                  ? finding.evidence.trim()
+                  : (finding.evidence && typeof finding.evidence.excerpt === 'string')
+                    ? finding.evidence.excerpt.trim()
+                    : null;
+
+              if (excerpt && !isGenericEvidence(excerpt)) {
+                const normContent = normalizeSnippet(fileContent);
+                const normExcerpt = normalizeSnippet(excerpt);
+                if (!normContent.includes(normExcerpt)) {
+                  challengePassed = false;
+                  status = FINDING_STATUSES.VERIFICATION_INCOMPLETE;
+                  rejectionReason = `Cited evidence excerpt was not found in '${relPath}'. Stale or fabricated citation.`;
+                  errors.push(rejectionReason);
+                }
+              }
             }
           }
+        } catch (err) {
+          challengePassed = false;
+          status = FINDING_STATUSES.VERIFICATION_INCOMPLETE;
+          rejectionReason = `Could not read cited file '${relPath}' to verify citations: ${err.message}`;
+          errors.push(rejectionReason);
         }
-      } catch (err) {
-        challengePassed = false;
-        status = FINDING_STATUSES.VERIFICATION_INCOMPLETE;
-        rejectionReason = `Could not read cited file '${relPath}' to verify citations: ${err.message}`;
-        errors.push(rejectionReason);
       }
     }
   }
@@ -323,60 +382,55 @@ export function validateFindingEvidence(finding, context = {}) {
     const ruleId = finding.rule ? finding.rule.id : '';
 
     if (ruleId === 'RULE-NO-UNNECESSARY-DEPENDENCIES') {
-      // Check package.json context: package must be in production dependencies
-      const pkgPath = path.resolve(repositoryRoot, 'package.json');
-      if (!fs.existsSync(pkgPath)) {
+      const effectiveResult = getEffectivePackageJson(repositoryRoot, context.diffResult);
+      if (!effectiveResult.success) {
         challengePassed = false;
         status = FINDING_STATUSES.VERIFICATION_INCOMPLETE;
-        rejectionReason = "File 'package.json' does not exist in repository root to verify production dependencies.";
+        rejectionReason = `Failed to inspect package.json during false-positive challenge: ${effectiveResult.error}`;
         errors.push(rejectionReason);
       } else {
-        try {
-          const pkgData = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
-          const prodDeps = (pkgData && typeof pkgData.dependencies === 'object' && pkgData.dependencies) || {};
+        const pkgData = effectiveResult.data;
+        const prodDeps = (pkgData && typeof pkgData.dependencies === 'object' && pkgData.dependencies) || {};
 
-          const evidenceStr =
-            typeof finding.evidence === 'string'
-              ? finding.evidence.trim()
-              : (finding.evidence && typeof finding.evidence.excerpt === 'string')
-                ? finding.evidence.excerpt.trim()
-                : '';
+        const evidenceStr =
+          typeof finding.evidence === 'string'
+            ? finding.evidence.trim()
+            : (finding.evidence && typeof finding.evidence.excerpt === 'string')
+              ? finding.evidence.excerpt.trim()
+              : '';
 
-          const explanationText = (finding.explanation || finding.details || '').trim();
-          const depMatch =
-            (evidenceStr && evidenceStr.match(/["'](@?[a-zA-Z0-9_.-]+(?:\/[a-zA-Z0-9_.-]+)?)["']:\s*["'][^"']+["']/)) ||
-            (evidenceStr && evidenceStr.match(/^["'](@?[a-zA-Z0-9_.-]+(?:\/[a-zA-Z0-9_.-]+)?)["']:/)) ||
-            (finding.title && finding.title.match(/[:\s](@?[a-zA-Z0-9_.-]+(?:\/[a-zA-Z0-9_.-]+)?)$/)) ||
-            (explanationText && explanationText.match(/Package ['"](@?[a-zA-Z0-9_.-]+(?:\/[a-zA-Z0-9_.-]+)?)['"]/));
+        const explanationText = (finding.explanation || finding.details || '').trim();
+        const depMatch =
+          (evidenceStr && evidenceStr.match(/["'](@?[a-zA-Z0-9_.-]+(?:\/[a-zA-Z0-9_.-]+)?)["']:\s*["'][^"']+["']/)) ||
+          (evidenceStr && evidenceStr.match(/^["'](@?[a-zA-Z0-9_.-]+(?:\/[a-zA-Z0-9_.-]+)?)["']:/)) ||
+          (finding.title && finding.title.match(/[:\s](@?[a-zA-Z0-9_.-]+(?:\/[a-zA-Z0-9_.-]+)?)$/)) ||
+          (explanationText && explanationText.match(/Package ['"](@?[a-zA-Z0-9_.-]+(?:\/[a-zA-Z0-9_.-]+)?)['"]/));
 
-          const pkgName = depMatch ? depMatch[1] : null;
+        const pkgName = depMatch ? depMatch[1] : null;
 
-          if (!pkgName) {
-            challengePassed = false;
-            status = FINDING_STATUSES.UNVERIFIED;
-            rejectionReason = 'Could not identify declared package name from evidence or title to substantiate dependency violation.';
-            errors.push(rejectionReason);
-          } else if (!Object.prototype.hasOwnProperty.call(prodDeps, pkgName)) {
-            // If package is not in production dependencies (e.g. devDependency or missing) -> false positive
-            challengePassed = false;
-            status = FINDING_STATUSES.UNVERIFIED;
-            rejectionReason = `False positive: Package '${pkgName}' is not declared in production 'dependencies'.`;
-            errors.push(rejectionReason);
-          } else {
-            // Challenge against codebase usage references
-            const usage = isPackageReferencedInCodebase(pkgName, repositoryRoot);
-            if (usage.referenced) {
-              challengePassed = false;
-              status = FINDING_STATUSES.UNVERIFIED;
-              rejectionReason = `False positive: Package '${pkgName}' is referenced in '${path.relative(repositoryRoot, usage.file)}'.`;
-              errors.push(rejectionReason);
-            }
-          }
-        } catch (err) {
+        if (!pkgName) {
           challengePassed = false;
-          status = FINDING_STATUSES.VERIFICATION_INCOMPLETE;
-          rejectionReason = `Failed to parse package.json during false-positive challenge: ${err.message}`;
+          status = FINDING_STATUSES.UNVERIFIED;
+          rejectionReason = 'Could not identify declared package name from evidence or title to substantiate dependency violation.';
           errors.push(rejectionReason);
+        } else if (!Object.prototype.hasOwnProperty.call(prodDeps, pkgName)) {
+          // If package is not in production dependencies (e.g. devDependency or missing) -> false positive
+          challengePassed = false;
+          status = FINDING_STATUSES.UNVERIFIED;
+          rejectionReason = `False positive: Package '${pkgName}' is not declared in production 'dependencies'.`;
+          errors.push(rejectionReason);
+        } else {
+          // Challenge against codebase usage references
+          const effectiveResult = getEffectiveSourceContents(repositoryRoot, context.diffResult);
+          const usage = effectiveResult.success
+            ? isPackageReferenced(pkgName, effectiveResult.files)
+            : isPackageReferencedInCodebase(pkgName, repositoryRoot);
+          if (usage.referenced) {
+            challengePassed = false;
+            status = FINDING_STATUSES.UNVERIFIED;
+            rejectionReason = `False positive: Package '${pkgName}' is referenced in '${path.relative(repositoryRoot, usage.referencedIn || usage.file)}'.`;
+            errors.push(rejectionReason);
+          }
         }
       }
     }
