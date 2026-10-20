@@ -10,6 +10,7 @@ import { SEVERITIES, FINDING_STATUSES } from '../src/severities.mjs';
 import { validateFinding } from '../src/finding-schema.mjs';
 import { UNIVERSAL_RULES } from '../src/universal-rules.mjs';
 import { checkUnusedDependencies } from '../src/checks/unused-dependencies.mjs';
+import { checkPostImplementation } from '../src/checks/post-implementation.mjs';
 import { generateFinding } from '../src/finding-generator.mjs';
 import { validateFindingEvidence } from '../src/finding-validator.mjs';
 import { runGate } from '../src/gate-runner.mjs';
@@ -1495,6 +1496,670 @@ describe('Bloat Checker Behavioral Test Suite', () => {
       assert.equal(res.status, FINDING_STATUSES.VERIFIED);
       assert.equal(res.valid, true);
       assert.equal(res.finding.blocksWorkflow, true);
+    });
+  });
+
+  describe('14. Unit 15 — Post-Implementation Quality Gate', () => {
+    it('evaluates clean implementation with aligned goal, returning PASS with exit code 0', async () => {
+      const cleanDiff = `diff --git a/src/math.js b/src/math.js
+new file mode 100644
+--- /dev/null
++++ b/src/math.js
+@@ -0,0 +1,5 @@
++export function calculateTax(amount, rate) {
++  if (typeof amount !== 'number' || typeof rate !== 'number') return 0;
++  return amount * rate;
++}
++`;
+      const res = await runGate({
+        repositoryRoot: fixtureDir,
+        diff: cleanDiff,
+        goal: 'Implement calculateTax function to compute tax amounts based on rates',
+        postImplementation: true,
+        silent: true,
+      });
+
+      assert.equal(res.verdict, 'PASS');
+      assert.equal(res.exitCode, 0);
+      assert.equal(res.decision, 'pass');
+      assert.equal(res.findings.length, 0);
+    });
+
+    it('detects demonstrable bloat: unused imports, silent catch blocks, and dead code, returning FAIL with exit code 1', async () => {
+      const bloatDiff = `diff --git a/src/service.js b/src/service.js
+new file mode 100644
+--- /dev/null
++++ b/src/service.js
+@@ -0,0 +1,18 @@
++import { unreferencedHelper } from './helpers.js';
++
++const deadInternalFunc = () => {
++  return 'never invoked';
++};
++
++export function performWork() {
++  try {
++    const x = 10;
++  } catch (err) {}
++  return true;
++}
++`;
+      const res = await runGate({
+        repositoryRoot: fixtureDir,
+        diff: bloatDiff,
+        goal: 'Implement performWork service to process items',
+        postImplementation: true,
+        silent: true,
+      });
+
+      assert.equal(res.verdict, 'FAIL');
+      assert.equal(res.exitCode, 1);
+      assert.ok(res.findings.some((f) => f.rule?.id === 'RULE-NO-UNUSED-LOCALS'));
+      assert.ok(res.findings.some((f) => f.rule?.id === 'RULE-NO-SILENT-FAILURES'));
+    });
+
+    it('detects unfulfilled goal when reviewed changes are completely unrelated to requested goal', async () => {
+      const unrelatedDiff = `diff --git a/docs/notes.txt b/docs/notes.txt
+new file mode 100644
+--- /dev/null
++++ b/docs/notes.txt
+@@ -0,0 +1,3 @@
++Random note about meeting schedule
++Discussing sprint retro
++`;
+      const res = await runGate({
+        repositoryRoot: fixtureDir,
+        diff: unrelatedDiff,
+        goal: 'Implement OAuth2 authorization flow with JWT token signing and refresh',
+        postImplementation: true,
+        silent: true,
+      });
+
+      assert.equal(res.verdict, 'FAIL');
+      assert.equal(res.exitCode, 1);
+      assert.ok(res.findings.some((f) => f.rule?.id === 'RULE-GOAL-ALIGNMENT'));
+    });
+
+    it('evaluates changes when goal is omitted, stating limitation and capping verdict at PASS WITH WARNINGS', async () => {
+      const cleanDiff = `diff --git a/src/calc.js b/src/calc.js
+new file mode 100644
+--- /dev/null
++++ b/src/calc.js
+@@ -0,0 +1,3 @@
++export function add(a, b) {
++  return a + b;
++}
++`;
+      const res = await runGate({
+        repositoryRoot: fixtureDir,
+        diff: cleanDiff,
+        postImplementation: true,
+        silent: true,
+      });
+
+      assert.equal(res.verdict, 'PASS WITH WARNINGS');
+      assert.equal(res.exitCode, 0);
+      assert.equal(res.decision, 'pass_with_warnings');
+      assert.ok(
+        res.warnings.some((w) =>
+          w.includes('no goal was provided') || w.includes('Original implementation goal was not provided')
+        )
+      );
+    });
+
+    it('fails closed on malformed input: non-existent goal file, non-existent repository, or invalid diff', async () => {
+      const resMissingGoalFile = await runGate({
+        repositoryRoot: fixtureDir,
+        goalFile: 'non-existent-goal-file.md',
+        postImplementation: true,
+        silent: true,
+      });
+      assert.equal(resMissingGoalFile.exitCode, 3);
+      assert.equal(resMissingGoalFile.verdict, 'FAIL');
+
+      const resBadRepo = await runGate({
+        repositoryRoot: path.join(fixtureDir, 'does-not-exist-folder-xyz'),
+        goal: 'Some goal',
+        postImplementation: true,
+        silent: true,
+      });
+      assert.equal(resBadRepo.exitCode, 3);
+      assert.equal(resBadRepo.verdict, 'FAIL');
+
+      const resInvalidDiffType = await runGate({
+        repositoryRoot: fixtureDir,
+        diff: 12345,
+        goal: 'Some goal',
+        postImplementation: true,
+        silent: true,
+      });
+      assert.equal(resInvalidDiffType.exitCode, 3);
+      assert.equal(resInvalidDiffType.verdict, 'FAIL');
+
+      const resEmptyDiffHunks = await runGate({
+        repositoryRoot: fixtureDir,
+        diff: 'not a valid git diff string at all',
+        goal: 'Some goal',
+        postImplementation: true,
+        silent: true,
+      });
+      assert.equal(resEmptyDiffHunks.exitCode, 1);
+      assert.equal(resEmptyDiffHunks.verdict, 'FAIL');
+      assert.ok(resEmptyDiffHunks.findings.some((f) => f.rule?.id === 'RULE-GOAL-ALIGNMENT'));
+    });
+
+    it('preserves existing dependency check and standard gate behavior without regressions', async () => {
+      const cleanDependencyDiff = `diff --git a/package.json b/package.json
+index 1234567..89abcdef 100644
+--- a/package.json
++++ b/package.json
+@@ -5,2 +5,3 @@
+   "dependencies": {
++    "used-lib": "^2.0.0",
+     "other-pkg": "^1.0.0"
+diff --git a/src/app.js b/src/app.js
+new file mode 100644
+--- /dev/null
++++ b/src/app.js
+@@ -0,0 +1,2 @@
++import { helper } from 'used-lib';
++helper();
++`;
+      const resClean = await runGate({
+        repositoryRoot: fixtureDir,
+        diff: cleanDependencyDiff,
+        silent: true,
+      });
+      assert.equal(resClean.exitCode, 0);
+      assert.equal(resClean.decision, 'pass');
+      assert.equal(resClean.verdict, 'PASS');
+
+      const unusedDepDiff = `diff --git a/package.json b/package.json
+index 1234567..89abcdef 100644
+--- a/package.json
++++ b/package.json
+@@ -4,2 +4,3 @@
+   "dependencies": {
++    "unused-lib": "^1.0.0",
+`;
+      const resUnused = await runGate({
+        repositoryRoot: fixtureDir,
+        diff: unusedDepDiff,
+        silent: true,
+      });
+      assert.equal(resUnused.exitCode, 1);
+      assert.equal(resUnused.decision, 'blocked');
+      assert.equal(resUnused.verdict, 'FAIL');
+      assert.ok(resUnused.findings.some((f) => f.rule?.id === 'RULE-NO-UNNECESSARY-DEPENDENCIES'));
+    });
+  });
+
+  describe('15. Unit 16 — Adversarial Audit Regressions', () => {
+    it('validates RULE-TEST-ADEQUACY advisory metric findings without requiring source lines citation', async () => {
+      const testDir = path.join(fixtureDir, 'test');
+      if (!fs.existsSync(testDir)) {
+        fs.mkdirSync(testDir, { recursive: true });
+      }
+
+      const prodOnlyDiff = `diff --git a/src/service.js b/src/service.js
+new file mode 100644
+--- /dev/null
++++ b/src/service.js
+@@ -0,0 +1,28 @@
++export function executeWorkflow(data) {
++  if (!data) return false;
++  const processed = data.map((x) => x * 2);
++  const step1 = processed.filter((x) => x > 10);
++  const step2 = step1.map((n) => n + 1);
++  const step3 = step2.map((n) => n * 3);
++  const step4 = step3.filter((n) => n % 2 === 0);
++  const step5 = step4.map((n) => \`item-\${n}\`);
++  const step6 = step5.slice(0, 100);
++  const step7 = step6.reverse();
++  const step8 = step7.map((s) => s.toUpperCase());
++  const step9 = step8.join(',');
++  const step10 = step9.split(',');
++  const step11 = step10.map((s) => s.toLowerCase());
++  const step12 = step11.filter((s) => s.length > 3);
++  const step13 = step12.map((s) => s.trim());
++  const step14 = step13.sort();
++  const step15 = step14.map((s, i) => \`\${i}:\${s}\`);
++  const step16 = step15.filter((entry) => Boolean(entry));
++  const step17 = step16.map((entry) => entry.replace(':', '='));
++  const step18 = step17.concat(['end']);
++  const step19 = step18.map((e) => e.length);
++  const step20 = step19.reduce((a, b) => a + b, 0);
++  return step20;
++}
++`;
+      const res = await runGate({
+        repositoryRoot: fixtureDir,
+        diff: prodOnlyDiff,
+        goal: 'Add executeWorkflow data processing service',
+        postImplementation: true,
+        silent: true,
+      });
+
+      assert.equal(res.exitCode, 0, 'Advisory test adequacy finding must not cause fail-closed exit code 2');
+      assert.equal(res.verdict, 'PASS WITH WARNINGS');
+      const adequacyFinding = res.findings.find((f) => f.rule?.id === 'RULE-TEST-ADEQUACY');
+      assert.ok(adequacyFinding, 'Should report RULE-TEST-ADEQUACY finding');
+      assert.equal(adequacyFinding.status, 'unverified');
+    });
+
+    it('evaluates dependencies in direct diff even when package.json is not written to disk', async () => {
+      const unwrittenDepDiff = `diff --git a/package.json b/package.json
+index 1234567..89abcdef 100644
+--- a/package.json
++++ b/package.json
+@@ -4,2 +4,3 @@
+   "dependencies": {
++    "phantom-unwritten-bloat": "^1.0.0",
+`;
+      const res = await runGate({
+        repositoryRoot: fixtureDir,
+        diff: unwrittenDepDiff,
+        postImplementation: true,
+        silent: true,
+      });
+
+      assert.equal(res.exitCode, 1, 'Unused dependency in direct diff must fail with exit code 1');
+      assert.equal(res.verdict, 'FAIL');
+      assert.ok(res.findings.some((f) => f.rule?.id === 'RULE-NO-UNNECESSARY-DEPENDENCIES'));
+    });
+
+    it('does not flag dependency in direct diff when referenced by unwritten diff file', async () => {
+      const referencedDepDiff = `diff --git a/package.json b/package.json
+index 1234567..89abcdef 100644
+--- a/package.json
++++ b/package.json
+@@ -4,2 +4,3 @@
+   "dependencies": {
++    "virtual-used-lib": "^2.1.0",
+diff --git a/src/feature.js b/src/feature.js
+new file mode 100644
+--- /dev/null
++++ b/src/feature.js
+@@ -0,0 +1,5 @@
++import { helper } from 'virtual-used-lib';
++export function runFeature() {
++  return helper();
++}
++`;
+      const res = await runGate({
+        repositoryRoot: fixtureDir,
+        diff: referencedDepDiff,
+        goal: 'Add virtual-used-lib feature',
+        postImplementation: true,
+        silent: true,
+      });
+
+      assert.equal(res.exitCode, 0);
+      assert.ok(!res.findings.some((f) => f.rule?.id === 'RULE-NO-UNNECESSARY-DEPENDENCIES'));
+    });
+
+    it('fails closed with exit code 2 when direct diff contains incomplete or malformed package.json diff', async () => {
+      const malformedPkgDiff = `diff --git a/package.json b/package.json
+index 1234567..89abcdef 100644
+--- a/package.json
++++ b/package.json
+@@ -4,2 +4,3 @@
+   "dependencies": {
++    "malformed-dep-line": NOT VALID JSON AT ALL
+`;
+      const res = await runGate({
+        repositoryRoot: fixtureDir,
+        diff: malformedPkgDiff,
+        postImplementation: true,
+        silent: true,
+      });
+
+      assert.equal(res.exitCode, 2, 'Malformed package.json diff must fail closed with exit code 2');
+      assert.equal(res.decision, 'incomplete');
+      assert.ok(res.errors.some((e) => e.includes('Incomplete or malformed package.json diff')));
+    });
+
+    it('rejects goalFile directory traversal (../../secret.txt) with exit code 3', async () => {
+      const res = await runGate({
+        repositoryRoot: fixtureDir,
+        goalFile: '../../secret.txt',
+        postImplementation: true,
+        silent: true,
+      });
+
+      assert.equal(res.exitCode, 3, 'Directory traversal in goalFile must exit with code 3');
+      assert.equal(res.verdict, 'FAIL');
+      assert.ok(res.errors.some((e) => e.includes('escapes repository root')));
+    });
+
+    it('rejects goalFile with absolute path outside repository root with exit code 3', async () => {
+      const externalPath = path.resolve(fixtureDir, '../../outside-goal.md');
+      const res = await runGate({
+        repositoryRoot: fixtureDir,
+        goalFile: externalPath,
+        postImplementation: true,
+        silent: true,
+      });
+
+      assert.equal(res.exitCode, 3, 'External absolute goalFile path must exit with code 3');
+      assert.equal(res.verdict, 'FAIL');
+      assert.ok(res.errors.some((e) => e.includes('escapes repository root')));
+    });
+
+    it('successfully loads and evaluates valid in-repository goalFile', async () => {
+      const inRepoGoalPath = path.join(fixtureDir, 'valid-goal.md');
+      fs.writeFileSync(inRepoGoalPath, '# Feature Goal\nImplement order calculation service for checkout');
+
+      try {
+        const cleanDiff = `diff --git a/src/order.js b/src/order.js
+new file mode 100644
+--- /dev/null
++++ b/src/order.js
+@@ -0,0 +1,5 @@
++export function calculateOrderTotal(items) {
++  return items.reduce((sum, item) => sum + item.price, 0);
++}
++`;
+        const res = await runGate({
+          repositoryRoot: fixtureDir,
+          goalFile: 'valid-goal.md',
+          diff: cleanDiff,
+          postImplementation: true,
+          silent: true,
+        });
+
+        assert.equal(res.exitCode, 0);
+        assert.equal(res.verdict, 'PASS');
+      } finally {
+        if (fs.existsSync(inRepoGoalPath)) {
+          fs.unlinkSync(inRepoGoalPath);
+        }
+      }
+    });
+
+    it('detects semantic emptiness when implementation contains only empty placeholder stubs', async () => {
+      const emptyStubDiff = `diff --git a/src/feature.js b/src/feature.js
+new file mode 100644
+--- /dev/null
++++ b/src/feature.js
+@@ -0,0 +1,5 @@
++export function processPayment(paymentDetails) {
++  // TODO: implement
++  return null;
++}
++`;
+      const res = await runGate({
+        repositoryRoot: fixtureDir,
+        diff: emptyStubDiff,
+        goal: 'Implement credit card payment processing pipeline',
+        postImplementation: true,
+        silent: true,
+      });
+
+      assert.equal(res.exitCode, 1, 'Empty placeholder stubs must fail with exit code 1');
+      assert.equal(res.verdict, 'FAIL');
+      const finding = res.findings.find((f) => f.rule?.id === 'RULE-GOAL-ALIGNMENT');
+      assert.ok(finding, 'Must flag RULE-GOAL-ALIGNMENT');
+      assert.equal(finding.severity, 'critical');
+      assert.equal(finding.status, 'verified');
+    });
+
+    it('does not treat zero keyword overlap alone as proof of goal failure for symptom-based bug fixes', async () => {
+      const bugFixDiff = `diff --git a/src/checkout.js b/src/checkout.js
+new file mode 100644
+--- /dev/null
++++ b/src/checkout.js
+@@ -0,0 +1,6 @@
++export function checkout(cart) {
++  if (!cart || !Array.isArray(cart.items)) {
++    return { status: 'error', message: 'Invalid cart payload' };
++  }
++  return { status: 'ready', count: cart.items.length };
++}
++`;
+      const res = await runGate({
+        repositoryRoot: fixtureDir,
+        diff: bugFixDiff,
+        goal: 'Fix null dereference crash during user transaction finalization',
+        postImplementation: true,
+        silent: true,
+      });
+
+      assert.equal(res.exitCode, 0, 'Symptom-based bug fix must not exit with code 1');
+      assert.equal(res.verdict, 'PASS WITH WARNINGS');
+      const finding = res.findings.find((f) => f.rule?.id === 'RULE-GOAL-ALIGNMENT');
+      assert.ok(finding, 'Must produce advisory finding for unverified domain alignment');
+      assert.equal(finding.status, 'unverified');
+      assert.equal(finding.severity, 'minor');
+    });
+
+    it('flags unnecessary delegating wrappers as advisory finding', async () => {
+      const wrapperDiff = `diff --git a/src/wrapper.js b/src/wrapper.js
+new file mode 100644
+--- /dev/null
++++ b/src/wrapper.js
+@@ -0,0 +1,9 @@
++import { doRealTask } from './worker.js';
++
++export function directForwarder(a, b) {
++  return doRealTask(a, b);
++}
++`;
+      const res = await runGate({
+        repositoryRoot: fixtureDir,
+        diff: wrapperDiff,
+        goal: 'Forward task calls to worker',
+        postImplementation: true,
+        silent: true,
+      });
+
+      assert.equal(res.exitCode, 0, 'Advisory bloat finding must not block workflow');
+      assert.equal(res.verdict, 'PASS WITH WARNINGS');
+      const bloatFinding = res.findings.find((f) => f.rule?.id === 'RULE-NO-SPECULATIVE-ABSTRACTIONS');
+      assert.ok(bloatFinding, 'Must identify unnecessary delegating wrapper');
+      assert.equal(bloatFinding.status, 'unverified');
+      assert.ok(bloatFinding.explanation.includes('delegating wrapper'));
+    });
+
+    it('flags duplicated multi-line logic blocks as advisory finding', async () => {
+      const dupDiff = `diff --git a/src/dup.js b/src/dup.js
+new file mode 100644
+--- /dev/null
++++ b/src/dup.js
+@@ -0,0 +1,14 @@
++export function processA(input) {
++  const step1 = input.trim().toLowerCase();
++  const step2 = step1.replace(/[^a-z0-9]/g, '');
++  const step3 = step2.split('').reverse().join('');
++  return step3;
++}
++
++export function processB(input) {
++  const step1 = input.trim().toLowerCase();
++  const step2 = step1.replace(/[^a-z0-9]/g, '');
++  const step3 = step2.split('').reverse().join('');
++  return step3;
++}
++`;
+      const res = await runGate({
+        repositoryRoot: fixtureDir,
+        diff: dupDiff,
+        goal: 'Add string processing routines',
+        postImplementation: true,
+        silent: true,
+      });
+
+      assert.equal(res.exitCode, 0);
+      assert.equal(res.verdict, 'PASS WITH WARNINGS');
+      const bloatFinding = res.findings.find((f) => f.rule?.id === 'RULE-NO-SPECULATIVE-ABSTRACTIONS');
+      assert.ok(bloatFinding, 'Must identify duplicated multi-line logic');
+      assert.ok(bloatFinding.explanation.includes('duplicated'));
+    });
+  });
+
+  describe('16. Unit 17 — Dependency Scanner Precision Regressions', () => {
+    it('flags dependency as unused when its only import is deleted in a direct diff', async () => {
+      const deletedImportDiff = `diff --git a/package.json b/package.json
+--- a/package.json
++++ b/package.json
+@@ -4,2 +4,3 @@
+   "dependencies": {
++    "phantom-deleted-lib": "^1.0.0",
+diff --git a/src/index.js b/src/index.js
+--- a/src/index.js
++++ b/src/index.js
+@@ -1,2 +1,1 @@
+-import { helper } from 'phantom-deleted-lib';
+ const answer = 42;
+`;
+      // Write import to disk first so pre-diff disk file has it
+      fs.writeFileSync(path.join(fixtureDir, 'src/index.js'), `import { helper } from 'phantom-deleted-lib';\nconst answer = 42;\nexport { answer };\n`);
+
+      const res = await runGate({
+        repositoryRoot: fixtureDir,
+        diff: deletedImportDiff,
+        silent: true,
+      });
+
+      // Restore index.js
+      setupFixture();
+
+      assert.equal(res.exitCode, 1);
+      assert.equal(res.verdict, 'FAIL');
+      assert.ok(res.findings.some((f) => f.rule?.id === 'RULE-NO-UNNECESSARY-DEPENDENCIES'));
+    });
+
+    it('flags unused dependency mentioned only in a quoted comment as unused', async () => {
+      fs.writeFileSync(
+        path.join(fixtureDir, 'src/index.js'),
+        `// import { foo } from 'comment-only-lib';\n/* 'comment-only-lib' is obsolete */\nconst answer = 42;\nexport { answer };\n`
+      );
+
+      const diff = `diff --git a/package.json b/package.json
+--- a/package.json
++++ b/package.json
+@@ -4,2 +4,3 @@
+   "dependencies": {
++    "comment-only-lib": "^1.0.0",
+`;
+      const res = await runGate({
+        repositoryRoot: fixtureDir,
+        diff,
+        silent: true,
+      });
+
+      // Restore index.js
+      setupFixture();
+
+      assert.equal(res.exitCode, 1);
+      assert.equal(res.verdict, 'FAIL');
+      assert.ok(res.findings.some((f) => f.rule?.id === 'RULE-NO-UNNECESSARY-DEPENDENCIES'));
+    });
+
+    it('preserves reference when legitimate import is in an unwritten new file in direct diff', async () => {
+      const diff = `diff --git a/package.json b/package.json
+--- a/package.json
++++ b/package.json
+@@ -4,2 +4,3 @@
+   "dependencies": {
++    "new-unwritten-lib": "^2.0.0",
+diff --git a/src/new-svc.js b/src/new-svc.js
+new file mode 100644
+--- /dev/null
++++ b/src/new-svc.js
+@@ -0,0 +1,3 @@
++import { run } from 'new-unwritten-lib';
++export const z = run();
++`;
+      const res = await runGate({
+        repositoryRoot: fixtureDir,
+        diff,
+        silent: true,
+      });
+
+      assert.equal(res.exitCode, 0);
+      assert.ok(!res.findings.some((f) => f.rule?.id === 'RULE-NO-UNNECESSARY-DEPENDENCIES'));
+    });
+
+    it('preserves reference when package is declared in supported configuration/plugin registration', async () => {
+      fs.writeFileSync(path.join(fixtureDir, 'src/plugin.config.js'), `module.exports = { plugins: ['my-plugin-lib'] };\n`);
+
+      const diff = `diff --git a/package.json b/package.json
+--- a/package.json
++++ b/package.json
+@@ -4,2 +4,3 @@
+   "dependencies": {
++    "my-plugin-lib": "^1.0.0",
+`;
+      const res = await runGate({
+        repositoryRoot: fixtureDir,
+        diff,
+        silent: true,
+      });
+
+      // Clean up config file
+      fs.rmSync(path.join(fixtureDir, 'src/plugin.config.js'), { force: true });
+
+      assert.equal(res.exitCode, 0);
+      assert.ok(!res.findings.some((f) => f.rule?.id === 'RULE-NO-UNNECESSARY-DEPENDENCIES'));
+    });
+
+    it('preserves references in unchanged files during direct diff evaluation', async () => {
+      fs.writeFileSync(path.join(fixtureDir, 'src/stable.js'), `import { x } from 'stable-dep';\nexport const v = x();\n`);
+
+      const diff = `diff --git a/package.json b/package.json
+--- a/package.json
++++ b/package.json
+@@ -4,2 +4,3 @@
+   "dependencies": {
++    "stable-dep": "^1.0.0",
+diff --git a/src/other.js b/src/other.js
+new file mode 100644
+--- /dev/null
++++ b/src/other.js
+@@ -0,0 +1,2 @@
++export const other = 1;
++export const extra = 2;
++`;
+      const res = await runGate({
+        repositoryRoot: fixtureDir,
+        diff,
+        silent: true,
+      });
+
+      fs.rmSync(path.join(fixtureDir, 'src/stable.js'), { force: true });
+
+      assert.equal(res.exitCode, 0);
+      assert.ok(!res.findings.some((f) => f.rule?.id === 'RULE-NO-UNNECESSARY-DEPENDENCIES'));
+    });
+
+    it('prevents stale-reference false positives from deleted files in direct diff', async () => {
+      fs.writeFileSync(path.join(fixtureDir, 'src/deleted.js'), `import { dead } from 'dead-dep';\n`);
+
+      const diff = `diff --git a/package.json b/package.json
+--- a/package.json
++++ b/package.json
+@@ -4,2 +4,3 @@
+   "dependencies": {
++    "dead-dep": "^1.0.0",
+diff --git a/src/deleted.js b/src/deleted.js
+deleted file mode 100644
+--- a/src/deleted.js
++++ /dev/null
+@@ -1,1 +0,0 @@
+-import { dead } from 'dead-dep';
++`;
+      const res = await runGate({
+        repositoryRoot: fixtureDir,
+        diff,
+        silent: true,
+      });
+
+      fs.rmSync(path.join(fixtureDir, 'src/deleted.js'), { force: true });
+
+      assert.equal(res.exitCode, 1);
+      assert.equal(res.verdict, 'FAIL');
+      assert.ok(res.findings.some((f) => f.rule?.id === 'RULE-NO-UNNECESSARY-DEPENDENCIES'));
     });
   });
 });
