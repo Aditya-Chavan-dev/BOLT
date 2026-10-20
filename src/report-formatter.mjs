@@ -172,12 +172,23 @@ export function formatHumanReport(runData) {
     throw new TypeError('formatHumanReport requires a valid runData object');
   }
 
-  const { decision = 'error', exitCode = 3, diff, rules, findings, checks, warnings, errors } = runData;
+  const { decision = 'error', exitCode = 3, diff, rules, findings, checks, warnings, errors, verdict, goal, isPostImplementation } = runData;
   const lines = [];
 
+  const displayVerdict = verdict || String(decision).toUpperCase();
   lines.push('================================================================');
-  lines.push(' BLOAT CHECKER V1 GATE REPORT');
-  lines.push(` Decision : ${String(decision).toUpperCase()} (Exit Code: ${exitCode})`);
+  if (isPostImplementation) {
+    lines.push(' BLOAT CHECKER POST-IMPLEMENTATION GATE REPORT');
+    lines.push(` Verdict  : ${verdict || String(decision).toUpperCase()} (Exit Code: ${exitCode})`);
+    if (goal) {
+      lines.push(` Goal     : ${goal}`);
+    } else {
+      lines.push(' Goal     : (Not provided — goal alignment unverified)');
+    }
+  } else {
+    lines.push(' BLOAT CHECKER V1 GATE REPORT');
+    lines.push(` Decision : ${String(decision).toUpperCase()} (Exit Code: ${exitCode})`);
+  }
   lines.push('================================================================');
   lines.push('');
 
@@ -317,6 +328,9 @@ export function formatJsonReport(runData) {
   const structured = {
     schemaVersion: SCHEMA_VERSION,
     decision: runData.decision || 'error',
+    verdict: runData.verdict || (runData.decision === 'pass' ? 'PASS' : runData.decision === 'pass_with_warnings' ? 'PASS WITH WARNINGS' : 'FAIL'),
+    goal: runData.goal || null,
+    isPostImplementation: Boolean(runData.isPostImplementation),
     exitCode: typeof runData.exitCode === 'number' ? runData.exitCode : 3,
     summary: runData.summary || '',
     stats,

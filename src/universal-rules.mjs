@@ -31,6 +31,30 @@ const RAW_UNIVERSAL_RULES = [
     enforcement: 'blocking',
     source: 'universal',
   }),
+  Object.freeze({
+    id: 'RULE-NO-SILENT-FAILURES',
+    description: 'Reject empty catch blocks and silent error swallowing without proper handling or logging.',
+    applicability: 'staged changes in git diff',
+    severity: SEVERITIES.MAJOR,
+    enforcement: 'blocking',
+    source: 'universal',
+  }),
+  Object.freeze({
+    id: 'RULE-GOAL-ALIGNMENT',
+    description: 'Reject implementations that fail to address the stated goal or introduce unrequested modifications.',
+    applicability: 'staged changes in git diff',
+    severity: SEVERITIES.CRITICAL,
+    enforcement: 'blocking',
+    source: 'universal',
+  }),
+  Object.freeze({
+    id: 'RULE-TEST-ADEQUACY',
+    description: 'Flag modifications to core logic lacking corresponding test coverage or verification.',
+    applicability: 'staged changes in git diff',
+    severity: SEVERITIES.MINOR,
+    enforcement: 'advisory',
+    source: 'universal',
+  }),
 ];
 
 // Validate all universal rules at initialization to guarantee schema integrity
