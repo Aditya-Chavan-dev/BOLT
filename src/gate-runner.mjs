@@ -4,8 +4,9 @@ import { fileURLToPath } from 'node:url';
 import { EXIT_CODES } from './constants.mjs';
 import { FINDING_STATUSES } from './severities.mjs';
 import { loadRules } from './rule-loader.mjs';
-import { readGitDiff } from './git-diff.mjs';
+import { readGitDiff, parseDirectDiff } from './git-diff.mjs';
 import { checkUnusedDependencies } from './checks/unused-dependencies.mjs';
+import { checkPostImplementation } from './checks/post-implementation.mjs';
 import { generateFinding } from './finding-generator.mjs';
 import { validateFinding } from './finding-schema.mjs';
 import { validateFindingEvidence } from './finding-validator.mjs';
@@ -17,6 +18,14 @@ export const MANDATORY_CHECKS = Object.freeze([
   Object.freeze({
     name: 'unused-dependencies',
     fn: checkUnusedDependencies,
+  }),
+]);
+
+export const POST_IMPLEMENTATION_CHECKS = Object.freeze([
+  ...MANDATORY_CHECKS,
+  Object.freeze({
+    name: 'post-implementation',
+    fn: checkPostImplementation,
   }),
 ]);
 
@@ -36,13 +45,17 @@ export const MANDATORY_CHECKS = Object.freeze([
  * @param {boolean} params.setupError - Whether a setup/configuration error occurred.
  * @param {boolean} params.verificationIncomplete - Whether any mandatory verification failed or was incomplete.
  * @param {ReadonlyArray<object>} params.findings - Generated finding objects.
- * @returns {{ exitCode: number, decision: 'pass' | 'blocked' | 'incomplete' | 'error', summary: string }}
+ * @param {boolean} [params.isPostImplementation] - Whether running in post-implementation mode.
+ * @param {boolean} [params.goalProvided] - Whether an implementation goal was supplied.
+ * @param {ReadonlyArray<string>} [params.warnings] - Accumulated warning messages.
+ * @returns {{ exitCode: number, decision: string, verdict: string, summary: string }}
  */
-function evaluateGatePolicy({ setupError, verificationIncomplete, findings }) {
+function evaluateGatePolicy({ setupError, verificationIncomplete, findings, isPostImplementation, goalProvided, warnings = [] }) {
   if (setupError) {
     return {
       exitCode: EXIT_CODES.SETUP_ERROR,
       decision: 'error',
+      verdict: 'FAIL',
       summary: 'Gate failed due to setup or configuration error.',
     };
   }
@@ -51,6 +64,7 @@ function evaluateGatePolicy({ setupError, verificationIncomplete, findings }) {
     return {
       exitCode: EXIT_CODES.VERIFICATION_FAILURE,
       decision: 'incomplete',
+      verdict: 'FAIL',
       summary: 'Gate failed closed: required verification could not complete or is incomplete.',
     };
   }
@@ -60,13 +74,36 @@ function evaluateGatePolicy({ setupError, verificationIncomplete, findings }) {
     return {
       exitCode: EXIT_CODES.POLICY_FAILURE,
       decision: 'blocked',
+      verdict: 'FAIL',
       summary: `Gate blocked: ${blockingFindings.length} verified blocking violation(s) detected.`,
+    };
+  }
+
+  if (isPostImplementation) {
+    const hasWarnings = (Array.isArray(warnings) && warnings.length > 0) || findings.length > 0 || !goalProvided;
+    if (hasWarnings) {
+      const reason = !goalProvided
+        ? 'Goal alignment could not be verified because no goal was provided.'
+        : `Gate passed with minor concerns: ${findings.length} advisory finding(s) or non-blocking warnings present.`;
+      return {
+        exitCode: EXIT_CODES.SUCCESS,
+        decision: 'pass_with_warnings',
+        verdict: 'PASS WITH WARNINGS',
+        summary: `Gate passed with warnings: ${reason}`,
+      };
+    }
+    return {
+      exitCode: EXIT_CODES.SUCCESS,
+      decision: 'pass',
+      verdict: 'PASS',
+      summary: 'Gate passed: goal achieved, appropriately scoped, with zero quality violations.',
     };
   }
 
   return {
     exitCode: EXIT_CODES.SUCCESS,
     decision: 'pass',
+    verdict: 'PASS',
     summary: 'Gate passed: all checks completed cleanly with zero blocking violations.',
   };
 }
@@ -99,6 +136,55 @@ export async function runGate(options = {}) {
 
   let setupError = false;
   let verificationIncomplete = false;
+
+  // Resolve goal and determine execution mode
+  let resolvedGoal = null;
+  if (options.goalFile) {
+    const rawGoalPath = String(options.goalFile).trim();
+    const resolvedRepo = path.resolve(repositoryRoot);
+    const resolvedGoalPath = path.resolve(resolvedRepo, rawGoalPath);
+    const relCheck = path.relative(resolvedRepo, resolvedGoalPath);
+
+    if (isEscapingRelative(relCheck)) {
+      setupError = true;
+      errors.push(`Goal file path '${rawGoalPath}' escapes repository root. External goal files are rejected.`);
+    } else if (!fs.existsSync(resolvedGoalPath)) {
+      setupError = true;
+      errors.push(`Goal file does not exist: ${resolvedGoalPath}`);
+    } else {
+      let symlinkEscapes = false;
+      try {
+        const realGoal = fs.realpathSync(resolvedGoalPath);
+        const realRepo = fs.realpathSync(resolvedRepo);
+        const relReal = path.relative(realRepo, realGoal);
+        if (isEscapingRelative(relReal)) {
+          symlinkEscapes = true;
+        }
+      } catch {
+        symlinkEscapes = true;
+      }
+
+      if (symlinkEscapes) {
+        setupError = true;
+        errors.push(`Goal file path '${rawGoalPath}' resolves outside repository root via symlink.`);
+      } else {
+        try {
+          resolvedGoal = fs.readFileSync(resolvedGoalPath, 'utf8').trim();
+        } catch (gErr) {
+          setupError = true;
+          errors.push(`Failed to read goal file: ${gErr.message}`);
+        }
+      }
+    }
+  } else if (options.goal !== undefined && options.goal !== null) {
+    resolvedGoal = String(options.goal).trim();
+  }
+
+  const isPostImplementation = Boolean(
+    options.postImplementation ||
+    options.goal !== undefined ||
+    options.goalFile !== undefined
+  );
 
   // 1. Verify repository root exists
   if (!fs.existsSync(repositoryRoot)) {
@@ -140,7 +226,28 @@ export async function runGate(options = {}) {
   // 3. Inspect git diff
   let diffResult = null;
   if (!setupError) {
-    if (options.diffResult) {
+    if (options.diff !== undefined) {
+      let diffContent = options.diff;
+      if (typeof diffContent === 'string' && !diffContent.includes('\n') && diffContent.trim().length > 0) {
+        const resolvedRepo = path.resolve(repositoryRoot);
+        const resolvedDiffPath = path.resolve(resolvedRepo, diffContent.trim());
+        const relCheck = path.relative(resolvedRepo, resolvedDiffPath);
+        if (!isEscapingRelative(relCheck) && fs.existsSync(resolvedDiffPath) && fs.statSync(resolvedDiffPath).isFile()) {
+          try {
+            diffContent = fs.readFileSync(resolvedDiffPath, 'utf8');
+          } catch {
+            // keep original
+          }
+        }
+      }
+      diffResult = parseDirectDiff(diffContent);
+      if (!diffResult.success) {
+        setupError = true;
+        errors.push(...diffResult.errors);
+      } else if (diffResult.warnings && diffResult.warnings.length > 0) {
+        warnings.push(...diffResult.warnings);
+      }
+    } else if (options.diffResult) {
       diffResult = options.diffResult;
       if (!diffResult || typeof diffResult !== 'object' || !diffResult.success) {
         setupError = true;
@@ -184,6 +291,7 @@ export async function runGate(options = {}) {
 
   // 4. Run checks (only if setup and diff inspection succeeded)
   if (!setupError && diffResult && diffResult.success) {
+    const baselineChecks = isPostImplementation ? POST_IMPLEMENTATION_CHECKS : MANDATORY_CHECKS;
     let checkDefinitions = [];
     if (options.checks !== undefined) {
       if (!Array.isArray(options.checks) || options.checks.length === 0) {
@@ -194,11 +302,11 @@ export async function runGate(options = {}) {
         const customFns = new Set(
           options.checks.map((c) => (typeof c === 'function' ? c : c && typeof c.fn === 'function' ? c.fn : null))
         );
-        const missingMandatory = MANDATORY_CHECKS.filter((m) => !customFns.has(m.fn));
+        const missingMandatory = baselineChecks.filter((m) => !customFns.has(m.fn));
         checkDefinitions = [...missingMandatory, ...options.checks];
       }
     } else {
-      checkDefinitions = [...MANDATORY_CHECKS];
+      checkDefinitions = [...baselineChecks];
     }
 
     for (const checkDef of checkDefinitions) {
@@ -234,7 +342,15 @@ export async function runGate(options = {}) {
           repositoryRoot,
           diffResult,
           rules: activeRules,
+          goal: resolvedGoal,
         });
+
+        if (Array.isArray(checkResult?.warnings) && checkResult.warnings.length > 0) {
+          warnings.push(...checkResult.warnings);
+        }
+        if (Array.isArray(checkResult?.limitations) && checkResult.limitations.length > 0) {
+          warnings.push(...checkResult.limitations);
+        }
 
         // Validate check result structure per Section 9 (malformed output must not pass)
         if (
@@ -291,6 +407,8 @@ export async function runGate(options = {}) {
                 repositoryRoot,
                 rules: activeRules,
                 ruleConflicts,
+                diffResult,
+                goal: resolvedGoal,
               });
 
               const finalFinding = validation.finding || finding;
@@ -337,6 +455,8 @@ export async function runGate(options = {}) {
           repositoryRoot,
           rules: activeRules,
           ruleConflicts,
+          diffResult,
+          goal: resolvedGoal,
         });
 
         if (!validation.valid && validation.status === FINDING_STATUSES.VERIFICATION_INCOMPLETE) {
@@ -361,12 +481,18 @@ export async function runGate(options = {}) {
     setupError,
     verificationIncomplete,
     findings,
+    isPostImplementation,
+    goalProvided: Boolean(resolvedGoal),
+    warnings,
   });
 
   const runData = {
     decision: policyOutcome.decision,
+    verdict: policyOutcome.verdict,
     exitCode: policyOutcome.exitCode,
     summary: policyOutcome.summary,
+    goal: resolvedGoal,
+    isPostImplementation,
     diff: diffResult,
     rules: Object.freeze(activeRules),
     findings: Object.freeze(findings),
@@ -480,7 +606,10 @@ export async function runGate(options = {}) {
       success: false,
       exitCode: finalExitCode,
       decision: finalDecision,
+      verdict: 'FAIL',
       summary: errorMsg,
+      goal: resolvedGoal,
+      isPostImplementation,
       report: errorMsg,
       findings: runData.findings,
       checks: runData.checks,
@@ -499,7 +628,10 @@ export async function runGate(options = {}) {
     success: policyOutcome.exitCode === EXIT_CODES.SUCCESS,
     exitCode: policyOutcome.exitCode,
     decision: policyOutcome.decision,
+    verdict: policyOutcome.verdict,
     summary: policyOutcome.summary,
+    goal: resolvedGoal,
+    isPostImplementation,
     report: reportText,
     findings: runData.findings,
     checks: runData.checks,
@@ -535,6 +667,10 @@ if (isDirectCliInvocation()) {
     outputJson: undefined,
     json: false,
     silent: false,
+    goal: undefined,
+    goalFile: undefined,
+    diff: undefined,
+    postImplementation: false,
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -547,6 +683,8 @@ if (isDirectCliInvocation()) {
       cliOptions.json = true;
     } else if (arg === '--silent') {
       cliOptions.silent = true;
+    } else if (arg === '--post-implementation') {
+      cliOptions.postImplementation = true;
     } else if (arg === '--base' && i + 1 < args.length) {
       cliOptions.base = args[++i];
     } else if (arg === '--repo' && i + 1 < args.length) {
@@ -555,6 +693,14 @@ if (isDirectCliInvocation()) {
       cliOptions.ssotPath = args[++i];
     } else if (arg === '--output-json' && i + 1 < args.length) {
       cliOptions.outputJson = args[++i];
+    } else if (arg === '--goal' && i + 1 < args.length) {
+      cliOptions.goal = args[++i];
+      cliOptions.postImplementation = true;
+    } else if (arg === '--goal-file' && i + 1 < args.length) {
+      cliOptions.goalFile = args[++i];
+      cliOptions.postImplementation = true;
+    } else if (arg === '--diff' && i + 1 < args.length) {
+      cliOptions.diff = args[++i];
     }
   }
 
